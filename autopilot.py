@@ -110,6 +110,7 @@ from analysis import (  # noqa: E402
     window_worse,
     _change_key,
 )
+from digest import build_digest, curriculum_managed_keys  # noqa: E402
 
 
 
@@ -120,9 +121,10 @@ from analysis import (  # noqa: E402
 class LlmCfg:
     base_url: str = "http://127.0.0.1:11434"
     model: str = "qwen3.5:35b-a3b-q4_K_M"
-    max_tokens: int = 3000
-    timeout_s: int = 300
+    max_tokens: int = 16000     # num_predict: thinking + the JSON answer
+    timeout_s: int = 900
     temperature: float = 0.2
+    think: bool = True
 
 
 @dataclass
@@ -464,6 +466,31 @@ def load_yaml(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def run_lineage(run: Run, max_hops: int = 8) -> list[Run]:
+    """The resume chain ending at run, oldest first.
+
+    Follows agent.yaml `load_run` while `resume` is true and it names a run
+    directory of the same experiment (the daemon always pins it).
+    """
+    chain = [run]
+    cur = run
+    for _ in range(max_hops):
+        p = cur.dir / "params" / "agent.yaml"
+        try:
+            agent = load_yaml(p) if p.exists() else {}
+        except Exception as exc:
+            log.warning("lineage: cannot parse %s: %s", p, exc)
+            break
+        if agent.get("resume") is not True:
+            break
+        prev_dir = cur.dir.parent / str(agent.get("load_run") or "")
+        if not agent.get("load_run") or not prev_dir.is_dir() or any(r.dir == prev_dir for r in chain):
+            break
+        cur = Run(prev_dir, run.experiment, prev_dir.name)
+        chain.append(cur)
+    return list(reversed(chain))
+
+
 def run_cfg(run: Run) -> tuple[dict, dict]:
     env_cfg: dict = {}
     agent_cfg: dict = {}
@@ -490,48 +517,70 @@ def run_cfg(run: Run) -> tuple[dict, dict]:
 
 SYSTEM_PROMPT = """You are the training supervisor for mjlab/PPO locomotion policies of the
 Microduck robot (14 XL330 servos, 25 cm, 800 g, 50 Hz, deployed via ONNX on the
-real robot). You receive a PRECOMPUTED analysis block from the local monitor —
-trends, plateau detection, penalty audit, reward mass, curriculum pacing,
-health and progress are already computed for you. Trust the numbers, quote them
-as evidence, do not recompute or invent metrics.
+real robot). The local monitor gives you a PRECOMPUTED `digest`. Read
+`digest.facts` first, then the numbers. Trust them, quote them as evidence, do
+not recompute or invent metrics.
+
+How to read the digest (units matter):
+- Survival is the primary health signal: `episode_now.mean_s` (seconds of a
+  `horizon_s` episode) and `episodes_ending_in_fall_pct`. Raw
+  Episode_Termination values are counts of envs per step, NOT percentages.
+- `task_errors_now` and `trends.lin_vel_error` / `yaw_vel_error` are the task.
+  They do not depend on reward weights.
+- `reward_terms_now`: `logged` is mjlab's Episode_Reward (episode sum / 20 s,
+  so it shrinks with short episodes). `raw_per_s_alive` is the UNWEIGHTED term
+  per second alive; for track_* kernels it reads as tracking quality in [0, 1].
+  `weight_now` is the weight in force (curricula override `weight_cfg`).
+  `share_of_abs_total_pct` is the reward MASS the policy feels, penalties
+  included; compare mass, not weights.
+- mean_reward (and plateau_on_mean_reward) changes scale whenever a weight
+  changes, yours or a curriculum's (`reward_weights_changed`). Never call a
+  drop at such a boundary a collapse; judge survival and task errors.
+- `curriculum_events` are grouped per iteration with survival / falls /
+  tracking error 25 iters before and after. A harder stage costs survival for
+  a while; that is expected, not a reason to change weights.
+- `run.resume_warmup`: right after a resume the new segment's episodic numbers
+  are not readable; the digest already shows the stretch before the resume.
+- `interventions`: earlier changes, their baseline and outcome. An outcome of
+  pending means it is still being evaluated: do not stack a second change on it
+  unless something critical happened. Repeating a change that did not help
+  is not a plan.
+- `trends.*.direction` is noise-aware: "flat" means no real change.
 
 Phases:
 - "monitoring": a run is active.
-    keep   = training is progressing; let it run.
-    adjust = plateau/harmful config proven; propose allowlisted changes.
+    keep   = training is progressing, or the evidence is ambiguous; let it run.
+    adjust = a specific, evidenced problem that ONE allowlisted change can
+             address; say which digest number you expect to move, and how.
     abort  = critical invariant broken; stop for human review.
 - "post_run": the run ENDED (target reached, crash or kill).
-    keep   = if progress.remaining is 0 or null the plan is COMPLETE (done);
-             if the run died early with remaining > 0, restart the SAME config
-             from the latest checkpoint to finish the plan.
+    keep   = if the plan is complete (no iterations remaining) it is DONE;
+             if the run died early, restart the SAME config from the latest
+             checkpoint to finish the plan.
     adjust = next phase needs config changes; if the plan is exhausted and you
              want more training, include "agent.max-iterations" as the NEW
              ABSOLUTE total (e.g. current done + 2000) in changes.
     abort  = do not restart; needs a human.
 
-Repository rules that constrain you (AGENTS.md — hard lessons):
-- SIGN CONVENTION: Episode_Reward/<term> logs the WEIGHTED value. mjlab-base
-  cost functions return >= 0 -> NEGATIVE weight; self-negating microduck
-  functions (*_penalty, *_l1) return <= 0 -> POSITIVE weight. Every penalty
-  term MUST log <= 0 — the penalty_audit block already flags violations
+Repository rules that constrain you (AGENTS.md, hard lessons):
+- SIGN CONVENTION: mjlab-base cost functions return >= 0 -> NEGATIVE weight;
+  self-negating microduck functions (*_penalty, *_l1) return <= 0 -> POSITIVE
+  weight. Every penalty term MUST log <= 0; penalty_audit flags violations
   (double negation: the policy farms the "penalty"). Fix the weight sign.
 - RL optimizes the letter of the reward: under-specified DOFs get exploited
-  (ballistic whip, butt-hopping, crash-sits). You can only reweight — if the
-  cure is a gate, say so in notes, do not fake it with weight nudges.
-- Never gate a positive reward on a bad state. If a positive term grows while
-  health.fell_over is high, suspect farming.
+  (ballistic whip, butt-hopping, crash-sits). You can only reweight; if the
+  cure is a gate, say so in notes, do not fake it with weight nudges. Claim an
+  exploit only with a digest number that shows it.
 - Regularizers: motion-blockers (body_ang_vel, angular_momentum, pose std)
-  suppress dynamic motion — keep LOW for dynamic tasks. Smoothness
-  (action_rate) is safe but heavy smoothness before skill discovery makes
-  "do nothing" win.
-- Compare reward MASS (reward_mass block), not weights: PPO sees relative
-  advantage; the same weight is 4x weaker under a 4x-larger positive stack.
-- Curricula must phase-align with learning; curriculum.pacing_warnings marks
-  metrics stepping DOWN at stage boundaries. You may NOT edit curricula (not
-  allowlisted) — put the recommendation in notes.
-- Main task term must grow (total reward can rise on regularizers alone);
-  episode length must behave as the task demands; typical gaits need
-  4000-6000 iterations — early runs are too early to judge.
+  suppress dynamic motion, keep them LOW for dynamic tasks. Smoothness
+  (action_rate) is safe in moderation, but a smoothness penalty that dominates
+  the mass before the skill exists makes "do nothing / fall early" win.
+- Lowering the main task term (track_*) rarely helps: it is what the policy is
+  for. Prefer reducing the term that crowds it out.
+- Curricula must phase-align with learning. You may NOT edit curricula or the
+  weights they set (`allowlist.rejected_because_curriculum_sets_them`); put
+  such a recommendation in notes.
+- Typical gaits need 4000-6000 iterations; early runs are too early to judge.
 - Honest reporting: if unsure, keep. Never invent numbers.
 - Changes: only keys in the allowlist, only numbers inside the given ranges,
   at most max_changes. Everything else goes to notes.
@@ -541,73 +590,84 @@ Output STRICT JSON only (no prose outside it):
   "verdict": "keep" | "adjust" | "abort",
   "confidence": 0.0..1.0,
   "diagnosis": "short, evidence-based",
-  "evidence": ["metric refs with numbers", ...],
-  "changes": [{"key": "<allowlisted-cli-flag>", "value": <number>, "reason": "..."}],
+  "evidence": ["digest refs with numbers", ...],
+  "changes": [{"key": "<allowlisted-cli-flag>", "value": <number>, "reason": "...",
+               "expected_effect": "which digest number should move, which way, within how many iters"}],
   "notes": "what a human should look at / ideas not expressible as a change"
 }"""
 
 
-def llm_analyze(cfg: Config, payload: dict) -> dict | None:
-    body = json.dumps(
-        {
-            "model": cfg.llm.model,
-            "max_tokens": cfg.llm.max_tokens,
-            "temperature": cfg.llm.temperature,
-            # qwen3.5's thinking block otherwise eats max_tokens and the reply
-            # never reaches the JSON (stop_reason=max_tokens, empty text).
-            "thinking": {"type": "disabled"},
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": json.dumps(payload, default=str)}],
-        }
-    ).encode()
-    req = urllib.request.Request(
-        cfg.llm.base_url.rstrip("/") + "/v1/messages",
-        data=body,
-        headers={
-            "content-type": "application/json",
-            "x-api-key": "ollama",
-            "anthropic-version": "2023-06-01",
+REC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": list(VERDICTS)},
+        "confidence": {"type": "number"},
+        "diagnosis": {"type": "string"},
+        "evidence": {"type": "array", "items": {"type": "string"}},
+        "changes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "value": {"type": "number"},
+                    "reason": {"type": "string"},
+                    "expected_effect": {"type": "string"},
+                },
+                "required": ["key", "value", "reason", "expected_effect"],
+            },
         },
-    )
-    reminder = None
+        "notes": {"type": "string"},
+    },
+    "required": ["verdict", "confidence", "diagnosis", "evidence", "changes", "notes"],
+}
+
+LLM_THINKING_KEEP = 6000    # chars of the model's reasoning kept on the rec
+
+
+def _ollama_chat(cfg: Config, messages: list[dict]) -> dict:
+    """Ollama native chat: `format` constrains the answer to REC_SCHEMA, and
+    with `think` the reasoning goes to message.thinking, outside the JSON."""
+    body = json.dumps({
+        "model": cfg.llm.model,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, *messages],
+        "stream": False,
+        "think": bool(cfg.llm.think),
+        "format": REC_SCHEMA,
+        "options": {"temperature": cfg.llm.temperature, "num_predict": cfg.llm.max_tokens},
+    }).encode()
+    req = urllib.request.Request(cfg.llm.base_url.rstrip("/") + "/api/chat", data=body,
+                                 headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=cfg.llm.timeout_s) as resp:
+        return json.loads(resp.read())
+
+
+def llm_analyze(cfg: Config, payload: dict) -> dict | None:
+    messages = [{"role": "user", "content": json.dumps(payload, default=str)}]
     for attempt in (1, 2):
         try:
-            with urllib.request.urlopen(req, timeout=cfg.llm.timeout_s) as resp:
-                data = json.loads(resp.read())
+            data = _ollama_chat(cfg, messages)
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             log.warning("LLM call failed (attempt %d): %s", attempt, exc)
-            if attempt == 2:
-                return None
-            continue
-        text = "".join(b.get("text", "") for b in data.get("content", []) if isinstance(b, dict))
+            return None
+        msg = data.get("message") or {}
+        text = msg.get("content") or ""
+        thinking = msg.get("thinking") or ""
         rec = extract_json(text)
         if rec is not None:
+            rec["llm_meta"] = {
+                "model": cfg.llm.model,
+                "think": bool(cfg.llm.think),
+                "done_reason": data.get("done_reason"),
+                "prompt_tokens": data.get("prompt_eval_count"),
+                "output_tokens": data.get("eval_count"),
+                "thinking": thinking[-LLM_THINKING_KEEP:] or None,
+            }
             return rec
-        log.warning("LLM returned unparseable output (attempt %d): %.400s", attempt, text)
-        reminder = "REMINDER: output ONLY a single valid JSON object."
-        if reminder:
-            body = json.dumps(
-                {
-                    "model": cfg.llm.model,
-                    "max_tokens": cfg.llm.max_tokens,
-                    "temperature": cfg.llm.temperature,
-            # qwen3.5's thinking block otherwise eats max_tokens and the reply
-            # never reaches the JSON (stop_reason=max_tokens, empty text).
-            "thinking": {"type": "disabled"},
-                    "system": SYSTEM_PROMPT,
-                    "messages": [
-                        {"role": "user", "content": json.dumps(payload, default=str)},
-                        {"role": "assistant", "content": text or "(empty)"},
-                        {"role": "user", "content": reminder},
-                    ],
-                }
-            ).encode()
-            req = urllib.request.Request(
-                cfg.llm.base_url.rstrip("/") + "/v1/messages",
-                data=body,
-                headers={"content-type": "application/json", "x-api-key": "ollama",
-                         "anthropic-version": "2023-06-01"},
-            )
+        log.warning("LLM returned unparseable output (attempt %d, done_reason=%s): %.400s",
+                    attempt, data.get("done_reason"), text or thinking[-400:])
+        messages = [*messages, {"role": "assistant", "content": text or "(empty)"},
+                    {"role": "user", "content": "REMINDER: output ONLY a single valid JSON object."}]
     return None
 
 
@@ -899,25 +959,26 @@ def smoke_test(orig_argv: list[str], changes: list[dict], cfg: Config,
 def build_payload(run: Run, m: Metrics, env_cfg: dict, agent_cfg: dict,
                   findings: list[Finding], state: dict, cfg: Config, phase: str) -> dict:
     exp = exp_state(state, run.experiment)
-    analysis = build_analysis(run, m, env_cfg, agent_cfg, cfg, state, phase)
+    segments = [s for s in (Metrics.load(r) for r in run_lineage(run)[:-1]) if s is not None]
+    dig = build_digest([*segments, m], env_cfg, exp, phase, m.sec_per_iter())
     payload: dict = {
         "phase": phase,
         "task_context": {
             "experiment": run.experiment,
             "run_name": run.name,
             "num_envs": (env_cfg.get("scene") or {}).get("num_envs"),
-            "max_iterations_in_cfg": agent_cfg.get("max_iterations"),
             "experiment_target_iterations": exp.get("target_iterations"),
+            "last_checkpoint_iter": run.checkpoint_iter(),
         },
-        "analysis": analysis,
+        "digest": dig,
         "findings": [f.__dict__ for f in findings],
-        "rewards_cfg": reward_table(env_cfg),
-        "curriculum_terms": sorted((env_cfg.get("events") or {}).keys())[:40],
-        "intervention_history": exp.get("interventions", [])[-6:],
+        "penalty_audit": penalty_audit(m, env_cfg, cfg, m.iters),
+        "plateau_on_mean_reward": plateau_report(m, cfg),
         "allowlist": {
             "keys": cfg.safety.allow,
             "ranges": cfg.safety.ranges,
             "max_changes": cfg.safety.max_changes,
+            "rejected_because_curriculum_sets_them": dig["curriculum_managed_weights"],
         },
     }
     if phase == "post_run":
@@ -1137,6 +1198,7 @@ def do_intervention(rec: dict, run: Run, cfg: Config, state: dict,
     ok, errors = validate_rec(
         rec, cfg, require_target_extension=(phase == "post_run" and exhausted),
         target_iterations=exp.get("target_iterations"),
+        frozen_keys=curriculum_managed_keys(run_cfg(run)[0]),
     )
     if not ok:
         record.update({"status": "rejected", "errors": errors})
@@ -1631,7 +1693,8 @@ def monitoring_phase(cfg: Config, state: dict, run: Run, force: bool, approve: b
     exp["last_diagnosis"] = rec.get("diagnosis")
     save_state(state)
 
-    ok, errors = validate_rec(rec, cfg, target_iterations=exp.get("target_iterations"))
+    ok, errors = validate_rec(rec, cfg, target_iterations=exp.get("target_iterations"),
+                              frozen_keys=curriculum_managed_keys(env_cfg))
     result: dict = {"status": "analyzed", "verdict": rec["verdict"],
                     "diagnosis": rec.get("diagnosis"), "errors": errors, "llm_s": llm_s}
 

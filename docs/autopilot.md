@@ -64,15 +64,35 @@ Everything deterministic is computed in `build_analysis()`:
 | `progress` | target, last checkpoint, `remaining_to_target` |
 | `findings` | rules-engine output: `nan_state`, `nonfinite_metric` (critical → auto-abort), `penalty_sign`, `stagnation`, `entropy_collapse`, `episode_len_collapse` |
 
-The LLM receives this + the reward table + allowlist/ranges + intervention
-history and must return STRICT JSON: `verdict`, `confidence`, `diagnosis`,
-`evidence`, `changes[]`, `notes`. On a live run the model is asked only when
+The LLM does not get these blocks raw. `digest.py` turns them into a
+`digest` with units, computed over the whole resume chain (`run_lineage`
+follows the pinned `load_run`; each resume drops its first 50 episodic
+iterations, when only short episodes have completed):
+
+| digest block | contents |
+| - | - |
+| `facts` | short English sentences, read first |
+| `run` | iter, plan %, resume points, `resume_warmup`, iters since the last change |
+| `episode_now` | mean episode in seconds and % of the horizon, % of endings that are falls, termination mix (termination tags are COUNTS per step, only ratios are readable) |
+| `task_errors_now`, `trends` | velocity tracking errors; median-of-quarters trends judged against noise (`flat` = no real change) |
+| `reward_terms_now` | per term: weight from cfg and weight in force (reward-weight curricula override it), logged value, unweighted rate per second alive (tracking kernels read as quality 0..1), share of the absolute mass |
+| `curriculum_events` | stage changes grouped per iteration, which reward weights they rescaled, survival/falls/tracking 25 iters before and after |
+| `interventions` | ledger: change, baseline, outcome |
+
+Alongside: `findings`, `penalty_audit`, `plateau_on_mean_reward` and the
+allowlist. Weights set by a curriculum are listed as not changeable, and
+`validate_rec` rejects them (`frozen_keys`). The call goes to Ollama's native
+`/api/chat` with `format` = the recommendation JSON schema and `think: true`;
+the model's reasoning is kept on the rec as `llm_meta.thinking` (last 6000
+chars). The answer is STRICT JSON: `verdict`, `confidence`, `diagnosis`,
+`evidence`, `changes[]` (each with `expected_effect`), `notes`. On a live run the model is asked only when
 the rules engine already raised a finding or the plateau detector fired;
 a quiet run records `keep` without a model call (`status: rules_keep`,
-`llm_s: 0`), and so does a run whose budget is spent (`status: llm_paused`).
-`post_run` always asks. Thinking is disabled for the local model —
-its reasoning block otherwise consumed `max_tokens` and the JSON never
-arrived. On unparseable output it is re-asked once with a reminder. Session
+`llm_s: 0`), and so does a run whose budget is spent, that is younger than
+`min_iters_before_intervene` or inside a cooldown (`status: llm_paused`).
+`post_run` always asks. With thinking on a call takes ~3-4 min on this box
+(~5.7k prompt + ~3k output tokens); `max_tokens` = 16000 covers both. On
+unparseable output it is re-asked once with a reminder. Session
 reports accumulate seconds spent inside `llm_analyze`.
 
 ## Safety (what the LLM can and cannot do)

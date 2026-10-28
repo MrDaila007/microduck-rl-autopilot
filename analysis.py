@@ -420,7 +420,9 @@ def _change_key(change: dict) -> str:
 
 
 def validate_rec(rec: dict, cfg: Config, require_target_extension: bool = False,
-                 target_iterations: int | None = None) -> tuple[bool, list[str]]:
+                 target_iterations: int | None = None,
+                 frozen_keys: set[str] | None = None) -> tuple[bool, list[str]]:
+    """frozen_keys: allowlisted keys a curriculum overwrites at runtime."""
     errors: list[str] = []
     verdict = rec.get("verdict")
     if verdict not in VERDICTS:
@@ -446,6 +448,9 @@ def validate_rec(rec: dict, cfg: Config, require_target_extension: bool = False,
             continue
         if any(fnmatch.fnmatch(key, pat) for pat in cfg.safety.deny):
             errors.append(f"key {key!r} is denylisted")
+            continue
+        if frozen_keys and key in frozen_keys:
+            errors.append(f"key {key!r} is set by a curriculum at runtime; changing it has no effect")
             continue
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             errors.append(f"value for {key} is not numeric: {value!r}")

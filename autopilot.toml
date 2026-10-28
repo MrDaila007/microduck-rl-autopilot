@@ -28,8 +28,13 @@ port = 8765
 [llm]
 base_url = "http://127.0.0.1:11434"
 model = "qwen3.5:35b-a3b-q4_K_M"
-max_tokens = 3000
-timeout_s = 300
+# Native /api/chat: the answer is constrained to the rec JSON schema, so the
+# model can think first (reasoning is kept on the rec as llm_meta.thinking).
+# max_tokens covers thinking + answer; context is the server's
+# OLLAMA_CONTEXT_LENGTH (65536), the payload is ~5k tokens.
+think = true
+max_tokens = 16000
+timeout_s = 900
 temperature = 0.2
 
 [monitor]
