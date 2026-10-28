@@ -1,12 +1,14 @@
 # Training autopilot — wake/sleep loop around a local rl run
 
-`autopilot.py` (this repo) supervises a mjlab/rsl_rl training run in another
-local repo (`[paths].mjlab_repo` in `autopilot.toml`, default
-`../microduck_rl`): it watches that repo's tfevents, precomputes ALL the
-analytics, asks the local LLM (Ollama, `qwen3.5:35b-a3b-q4_K_M`) only for
-judgment + plan, and (auto mode) applies allowlisted overrides by itself —
-smoke test → stop → resume from the latest checkpoint. Runs as the systemd
-user unit `microduck-rl-autopilot`.
+`autopilot.py` supervises a mjlab/rsl_rl training run in another local repo
+(`[paths].mjlab_repo` in `autopilot.toml`, default `../microduck_rl`): it
+watches that repo's tfevents, precomputes the analytics, asks the local LLM
+(Ollama, `qwen3.5:35b-a3b-q4_K_M`) only for judgment + plan, and (auto mode)
+applies allowlisted overrides by itself — smoke test → stop → resume from the
+latest checkpoint. The log math (trends, penalty audit, reward mass, rules,
+recommendation checks) lives in `analysis.py` and is re-exported from
+`autopilot`, so the dashboard and the tests keep the same names. Runs as the
+systemd user unit `microduck-rl-autopilot`.
 
 ## The cycle
 
@@ -213,7 +215,7 @@ Notes:
 
 ```
 autopilot/
-  autopilot.py, autopilot.toml   code + config
+  autopilot.py, analysis.py, autopilot.toml   supervisor, log analysis, config
   dashboard.py, dashboard/       local web UI (stdlib HTTP + one static page)
   docs/autopilot.md              this reference
   reports/

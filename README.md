@@ -51,7 +51,8 @@ parks it (never auto-relaunched). `autopilot reset --queue` re-enables.
 
 | path | what |
 | - | - |
-| `autopilot.py` | the whole autopilot (stdlib + tensorboard/yaml) |
+| `autopilot.py` | supervisor loop, smoke, relaunch, CLI. Re-exports `analysis` |
+| `analysis.py` | metrics, reward audit, rules, recommendation checks |
 | `autopilot.toml` | config: paths, scenario catalog + queue, safety allowlist, LLM, monitor cadence |
 | `docs/autopilot.md` | reference: cycle, scenarios, safety model, verdict semantics |
 | `reports/` | one markdown journal per daemon session |
