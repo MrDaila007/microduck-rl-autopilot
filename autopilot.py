@@ -4,11 +4,14 @@
 A wake/sleep cycle around a local mjlab/rsl_rl run:
 
   wake -> is a run active?
-    yes -> read tfevents, run the precomputed analytics, ask the local LLM
-           (Ollama): plateau? -> keep training, sleep
-                     adjust?   -> smoke-test the change, stop, resume from
-                                  the latest checkpoint with it, sleep
-                     abort?    -> stop for human review
+    yes -> read tfevents, run the precomputed analytics. A healthy run is
+           recorded as keep by the rules engine (no LLM). Findings, a plateau,
+           or a finished run ask the local LLM (Ollama):
+                     keep?   -> sleep
+                     adjust? -> smoke-test the change, stop, resume from
+                                the latest checkpoint with it, sleep.
+                                One later window can revert that change.
+                     abort?  -> stop for human review
     no  -> run ended: analyze the finished run, plan the next step with the
            LLM (done / continue / continue-with-changes), relaunch if it says
            so, then sleep. When nothing has ever run, optionally launch the
@@ -1085,7 +1088,12 @@ def stop_training(proc: dict, cfg: Config, state: dict) -> None:
 # --------------------------------------------------------------------------- validate
 
 
-def validate_rec(rec: dict, cfg: Config, require_target_extension: bool = False) -> tuple[bool, list[str]]:
+def _change_key(change: dict) -> str:
+    return str(change.get("key", "")).lstrip("-")
+
+
+def validate_rec(rec: dict, cfg: Config, require_target_extension: bool = False,
+                 target_iterations: int | None = None) -> tuple[bool, list[str]]:
     errors: list[str] = []
     verdict = rec.get("verdict")
     if verdict not in VERDICTS:
@@ -1103,7 +1111,7 @@ def validate_rec(rec: dict, cfg: Config, require_target_extension: bool = False)
     keys = set()
     for ch in changes:
         # allowlist/ranges are written without `--`; accept either spelling
-        key = str(ch.get("key", "")).lstrip("-")
+        key = _change_key(ch)
         keys.add(key)
         value = ch.get("value")
         if not any(fnmatch.fnmatch(key, pat) for pat in cfg.safety.allow):
@@ -1123,6 +1131,17 @@ def validate_rec(rec: dict, cfg: Config, require_target_extension: bool = False)
                 lo, hi = bounds
                 if not (lo <= float(value) <= hi):
                     errors.append(f"value {value} for {key} outside [{lo}, {hi}]")
+        # A running plan's horizon only grows. Cutting it short is a hand edit:
+        # the model otherwise replaces a multi-day target with a short one.
+        if (
+            key == "agent.max-iterations"
+            and target_iterations is not None
+            and float(value) < float(target_iterations)
+        ):
+            errors.append(
+                f"agent.max-iterations {value} would shorten target {target_iterations} "
+                "(shortening is manual)"
+            )
     if require_target_extension and "agent.max-iterations" not in keys:
         errors.append("plan exhausted: adjust must include agent.max-iterations (new absolute total)")
     return not errors, errors
@@ -1294,8 +1313,7 @@ def build_payload(run: Run, m: Metrics, env_cfg: dict, agent_cfg: dict,
         },
     }
     if phase == "post_run":
-        argv = state.get("experiments", {}).get(run.experiment, {}).get("last_argv") \
-            or state.get("last_train_argv")
+        argv = _known_argv(state, run, cfg)
         payload["task_context"]["original_command"] = " ".join(argv) if argv else None
         tail = _log_tail(cfg)
         payload["process_log_tail"] = tail
@@ -1323,6 +1341,231 @@ def write_rec(record: dict, tag: str) -> Path:
     return path
 
 
+def lookup_cfg_value(key: str, env_cfg: dict, agent_cfg: dict) -> Any:
+    """Current numeric value of an allowlisted key, used as the revert target."""
+    if key.startswith("env.rewards.") and key.endswith(".weight"):
+        term = key[len("env.rewards."):-len(".weight")]
+        row = (env_cfg.get("rewards") or {}).get(term)
+        if isinstance(row, dict):
+            return row.get("weight")
+        return None
+    if key == "agent.max-iterations":
+        return agent_cfg.get("max_iterations")
+    algorithm = agent_cfg.get("algorithm") or {}
+    if key == "agent.algorithm.learning-rate":
+        return algorithm.get("learning_rate")
+    if key == "agent.algorithm.entropy-coef":
+        return algorithm.get("entropy_coef")
+    if key == "env.scene.num-envs":
+        return (env_cfg.get("scene") or {}).get("num_envs")
+    return None
+
+
+def previous_values(changes: list[dict], env_cfg: dict, agent_cfg: dict) -> list[dict]:
+    out = []
+    for ch in changes:
+        key = _change_key(ch)
+        old = lookup_cfg_value(key, env_cfg, agent_cfg)
+        if isinstance(old, bool) or not isinstance(old, (int, float)):
+            continue
+        if not math.isfinite(float(old)):
+            continue
+        out.append({"key": key, "value": old})
+    return out
+
+
+def metric_snapshot(m: Metrics, it: int) -> dict:
+    """Point values at `it` (last sample at or before it) for the revert check."""
+    snap: dict[str, Any] = {"iter": it}
+    for name, tag in (
+        ("mean_reward", "Train/mean_reward"),
+        ("mean_episode_length", "Train/mean_episode_length"),
+        ("fell_over", "Episode_Termination/fell_over"),
+        ("entropy", "Loss/entropy"),
+    ):
+        pts = [(step, v) for step, v in m.series(tag) if step <= it and math.isfinite(v)]
+        snap[name] = pts[-1][1] if pts else None
+    return snap
+
+
+def window_worse(m: Metrics, snap: dict, lo: int, hi: int) -> bool:
+    """True when the post-change window fell more AND scored less than the snapshot."""
+    base_fell = snap.get("fell_over")
+    base_rew = snap.get("mean_reward")
+    if isinstance(base_fell, bool) or isinstance(base_rew, bool):
+        return False
+    if not isinstance(base_fell, (int, float)) or not isinstance(base_rew, (int, float)):
+        return False
+    fell = m.stats("Episode_Termination/fell_over", lo, hi)
+    rew = m.stats("Train/mean_reward", lo, hi)
+    if fell.get("n", 0) < 1 or rew.get("n", 0) < 1:
+        return False
+    return fell["mean"] > float(base_fell) and rew["mean"] < float(base_rew)
+
+
+def should_consult_llm(phase: str, findings: list[Finding], plateau: dict | None) -> bool:
+    """The local model is for judgment calls, not for a healthy keep.
+
+    post_run always plans. monitoring calls only when a rule already fired
+    or the plateau detector says the reward is flat. A quiet run records keep
+    without touching the GPU the trainer is using.
+    """
+    if phase == "post_run":
+        return True
+    if findings:
+        return True
+    return bool(plateau and plateau.get("flat") is True)
+
+
+def rules_keep(m: Metrics, cfg: Config, it: int) -> dict:
+    plat = plateau_report(m, cfg)
+    lo = max(0, it - cfg.monitor.stagnation_window + 1)
+    fell = m.stats("Episode_Termination/fell_over", lo, it)
+    slope = plat.get("slope")
+    parts = ["rules keep: no findings and no plateau"]
+    if slope is not None:
+        parts.append(f"mean_reward slope={slope}")
+    if fell.get("n"):
+        parts.append(f"fell_over mean={fell.get('mean')}")
+    return {
+        "verdict": "keep",
+        "confidence": 1.0,
+        "diagnosis": "; ".join(parts),
+        "evidence": [f"iterations={it}", f"plateau.flat={plat.get('flat')}"],
+        "changes": [],
+        "notes": "rules engine; LLM not consulted",
+        "source": "rules",
+    }
+
+
+def _mark_intervening(state: dict) -> None:
+    state["intervening"] = True
+    state["intervening_since"] = datetime.now(timezone.utc).isoformat()
+    save_state(state)
+
+
+def _clear_intervening(state: dict) -> None:
+    state["intervening"] = False
+    state["intervening_since"] = None
+    save_state(state)
+
+
+def _close_smoking_recs(reason: str, older_than_s: float | None = None) -> int:
+    if not RECS_DIR.is_dir():
+        return 0
+    closed = 0
+    now = time.time()
+    for path in RECS_DIR.glob("*.json"):
+        if older_than_s is not None:
+            try:
+                age = now - path.stat().st_mtime
+            except OSError:
+                continue
+            if age < older_than_s:
+                continue
+        rec = load_json(path, None)
+        if not isinstance(rec, dict) or rec.get("status") != "smoking":
+            continue
+        rec["status"] = "smoke_failed"
+        rec["smoke"] = reason
+        save_json(path, rec)
+        closed += 1
+    return closed
+
+
+def settle_smoke(cfg: Config, state: dict) -> str | None:
+    """Unstick a dead smoke: expired intervening flag, then old smoking files.
+
+    A recommendation still marked smoking and younger than smoke_timeout_s is
+    left alone, so a live smoke is not closed out from under itself.
+    """
+    reason = release_stale_intervening(cfg, state)
+    closed = _close_smoking_recs(
+        f"smoking record older than smoke_timeout_s={cfg.train.smoke_timeout_s}",
+        older_than_s=cfg.train.smoke_timeout_s,
+    )
+    if closed and not reason:
+        reason = f"closed {closed} smoking recs older than smoke_timeout_s"
+        log.error(reason)
+    return reason
+
+
+def release_stale_intervening(cfg: Config, state: dict) -> str | None:
+    """Drop a stuck intervening flag once the smoke timeout has elapsed.
+
+    A fresh flag (younger than smoke_timeout_s) stays set so a second smoke
+    cannot start. A flag with no timestamp is the pre-fix stuck state and is
+    cleared. Open recommendation files still marked smoking are closed.
+    Returns the reason when the flag was cleared, else None.
+    """
+    if not state.get("intervening"):
+        return None
+    since = state.get("intervening_since")
+    if not since:
+        reason = "intervening flag had no timestamp"
+    else:
+        try:
+            started = datetime.fromisoformat(str(since))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+        except ValueError:
+            started = None
+        if started is None:
+            reason = f"intervening_since unparsable: {since!r}"
+        else:
+            age = (datetime.now(timezone.utc) - started).total_seconds()
+            if age < cfg.train.smoke_timeout_s:
+                return None
+            reason = (
+                f"intervening for {int(age)}s "
+                f"past smoke_timeout_s={cfg.train.smoke_timeout_s}"
+            )
+    state["intervening"] = False
+    state["intervening_since"] = None
+    closed = _close_smoking_recs(reason)
+    save_state(state)
+    log.error("cleared stale intervening flag (%s); closed %d smoking recs", reason, closed)
+    return reason
+
+
+def _smoke_then_relaunch(run: Run, changes: list[dict], cfg: Config, state: dict,
+                         record: dict, rec_path: Path, argv: list[str],
+                         proc: dict | None) -> dict:
+    """Smoke, then relaunch. intervening is always cleared, including on crash."""
+    record["status"] = "smoking"
+    save_json(rec_path, record)
+    _mark_intervening(state)
+    try:
+        ok_smoke, why = smoke_test(argv, changes, cfg, state, rec_path.stem)
+        record["smoke"] = why
+        if not ok_smoke:
+            record["status"] = "smoke_failed"
+            save_json(rec_path, record)
+            log.error("smoke test failed: %s", why)
+            return record
+        if not cfg.auto.enabled:
+            record["status"] = "ready_to_apply"
+            save_json(rec_path, record)
+            log.info("smoke passed; auto disabled — run: autopilot apply %s", rec_path)
+            return record
+        if proc is not None:
+            stop_training(proc, cfg, state)
+            time.sleep(3)
+        exp = exp_state(state, run.experiment)
+        return _relaunch(
+            run, changes, cfg, state, record, rec_path,
+            checkpoints_report(run, exp.get("target_iterations")), argv,
+        )
+    except Exception as exc:
+        record["status"] = "smoke_failed"
+        record["smoke"] = f"{type(exc).__name__}: {exc}"
+        save_json(rec_path, record)
+        log.exception("intervention failed during smoke/relaunch")
+        return record
+    finally:
+        _clear_intervening(state)
+
+
 def do_intervention(rec: dict, run: Run, cfg: Config, state: dict,
                     phase: str = "monitoring") -> dict:
     """Validate -> (smoke) -> stop/relaunch, or record the decision."""
@@ -1338,7 +1581,10 @@ def do_intervention(rec: dict, run: Run, cfg: Config, state: dict,
         prog = checkpoints_report(run, exp.get("target_iterations"))
         exhausted = not prog.get("remaining_to_target")
 
-    ok, errors = validate_rec(rec, cfg, require_target_extension=(phase == "post_run" and exhausted))
+    ok, errors = validate_rec(
+        rec, cfg, require_target_extension=(phase == "post_run" and exhausted),
+        target_iterations=exp.get("target_iterations"),
+    )
     if not ok:
         record.update({"status": "rejected", "errors": errors})
         save_json(rec_path, record)
@@ -1388,55 +1634,108 @@ def do_intervention(rec: dict, run: Run, cfg: Config, state: dict,
         log.error("cannot intervene: original launch command unknown (daemon saw no live process)")
         return record
 
+    env_cfg, agent_cfg = run_cfg(run)
+    record["previous"] = previous_values(changes, env_cfg, agent_cfg)
+    record["kind"] = rec.get("kind") or "apply"
+    if record["kind"] != "revert" and not record.get("snapshot"):
+        measured = Metrics.load(run)
+        if measured is not None and measured.iters >= 1:
+            record["snapshot"] = metric_snapshot(measured, measured.iters)
+
     proc = find_train_proc(state)
-    if proc is not None:  # live run: smoke first, then stop
-        record["status"] = "smoking"
-        save_json(rec_path, record)
-        state["intervening"] = True
-        save_state(state)
-        try:
-            ok_smoke, why = smoke_test(argv, changes, cfg, state, tag)
-        finally:
-            state["intervening"] = False
-            save_state(state)
-        record["smoke"] = why
-        if not ok_smoke:
-            record["status"] = "smoke_failed"
-            save_json(rec_path, record)
-            log.error("smoke test failed: %s", why)
-            return record
-        if not cfg.auto.enabled:
-            record["status"] = "ready_to_apply"
-            save_json(rec_path, record)
-            log.info("smoke passed; auto disabled — run: autopilot apply %s", rec_path)
-            return record
-        stop_training(proc, cfg, state)
-        time.sleep(3)
-    elif not cfg.auto.enabled:
+    live = proc is not None and phase == "monitoring"
+    if not live and not cfg.auto.enabled:
         record["status"] = "ready_to_apply"
         save_json(rec_path, record)
         return record
-    else:
-        # ended run + changes: smoke, no stop needed
-        record["status"] = "smoking"
-        save_json(rec_path, record)
-        ok_smoke, why = smoke_test(argv, changes, cfg, state, tag)
-        record["smoke"] = why
-        if not ok_smoke:
-            record["status"] = "smoke_failed"
-            save_json(rec_path, record)
-            log.error("smoke test failed: %s", why)
-            return record
+    return _smoke_then_relaunch(
+        run, changes, cfg, state, record, rec_path, argv, proc if live else None,
+    )
 
-    return _relaunch(run, changes, cfg, state, record, rec_path,
-                     checkpoints_report(run, exp.get("target_iterations")), argv)
+
+def _argv_matches_task(argv: list[str], task: str | None) -> bool:
+    if not task:
+        return False
+    return str(task) in argv
+
+
+def _argv_from_wandb_meta(meta: Path) -> list[str] | None:
+    try:
+        data = json.loads(meta.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    args = data.get("args")
+    if not isinstance(args, list) or not args:
+        return None
+    program = data.get("program")
+    exe = data.get("executable")
+    if exe and program:
+        return [str(exe), str(program), *[str(a) for a in args]]
+    if program:
+        return [str(program), *[str(a) for a in args]]
+    return None
+
+
+def _wandb_meta_matches_run(meta: Path, run_name: str) -> bool:
+    """True when this wandb run's stdout names the rsl_rl run directory."""
+    log_path = meta.parent / "output.log"
+    try:
+        with log_path.open("r", errors="replace") as fh:
+            head = fh.read(8192)
+    except OSError:
+        return False
+    return run_name in head
+
+
+def argv_from_wandb(run: Run) -> list[str] | None:
+    """Launch argv recorded by wandb for this run, if the log names the run dir."""
+    candidates: list[Path] = []
+    if run.dir.is_dir():
+        candidates.extend(run.dir.rglob("wandb-metadata.json"))
+    wandb_root = MJLAB_REPO / "wandb"
+    if wandb_root.is_dir():
+        candidates.extend(wandb_root.glob("run-*/files/wandb-metadata.json"))
+    for meta in candidates:
+        if not _wandb_meta_matches_run(meta, run.dir.name):
+            continue
+        argv = _argv_from_wandb_meta(meta)
+        if argv:
+            return argv
+    return None
+
+
+def _store_argv(state: dict, run: Run, argv: list[str]) -> list[str]:
+    remembered = list(argv)
+    exp_state(state, run.experiment)["last_argv"] = remembered
+    state["last_train_argv"] = list(remembered)
+    return remembered
 
 
 def _known_argv(state: dict, run: Run, cfg: Config) -> list[str] | None:
-    argv = (state.get("experiments", {}).get(run.experiment, {}) or {}).get("last_argv")
-    if not argv:
-        argv = state.get("last_train_argv")
-    return list(argv) if argv else None
+    """Original launch command: state, then wandb metadata, then the scenario catalog.
+
+    A dead run often has no `last_argv` (the daemon never saw the process).
+    wandb-metadata.json still has program+args, and the experiment folder name
+    is a scenario key, so a relaunch does not die with status no_argv.
+    """
+    exp = (state.get("experiments") or {}).get(run.experiment) or {}
+    argv = exp.get("last_argv")
+    if argv:
+        return list(argv)
+    spec = scenario_spec(cfg, run.experiment)
+    task = str(spec["task"]) if spec and spec.get("task") else None
+    global_argv = state.get("last_train_argv")
+    if global_argv and _argv_matches_task(list(global_argv), task):
+        return _store_argv(state, run, list(global_argv))
+    recovered = argv_from_wandb(run)
+    if recovered:
+        log.info("recovered argv for %s from wandb metadata", run.dir.name)
+        return _store_argv(state, run, recovered)
+    launch = scenario_launch(cfg, run.experiment)
+    if launch is not None:
+        log.info("recovered argv for %s from scenario catalog", run.experiment)
+        return _store_argv(state, run, launch[0])
+    return None
 
 
 def _relaunch(run: Run, changes: list[dict], cfg: Config, state: dict, record: dict,
@@ -1473,9 +1772,22 @@ def _relaunch(run: Run, changes: list[dict], cfg: Config, state: dict, record: d
                    "checkpoint": ckpt.name if ckpt else None,
                    "iterations": remaining})
     save_json(rec_path, record)
-    exp["interventions"].append({"time": record["time"], "phase": record.get("phase"),
-                                 "changes": changes, "rec": str(rec_path),
-                                 "smoke": record.get("smoke")})
+    snap = record.get("snapshot") if isinstance(record.get("snapshot"), dict) else None
+    iter_at = done if done is not None else (snap or {}).get("iter")
+    entry = {
+        "time": record["time"],
+        "phase": record.get("phase"),
+        "changes": changes,
+        "previous": record.get("previous") or [],
+        "snapshot": snap,
+        "iter": iter_at,
+        "rec": str(rec_path),
+        "smoke": record.get("smoke"),
+        "kind": record.get("kind") or "apply",
+    }
+    if changes:
+        entry["outcome"] = "pending"
+    exp["interventions"].append(entry)
     exp["last_verdict"] = "adjust"
     if done is not None:
         # keep cooldown bookkeeping on the iteration axis of the new run
@@ -1487,9 +1799,147 @@ def _relaunch(run: Run, changes: list[dict], cfg: Config, state: dict, record: d
 
 def m_value(changes: list[dict]) -> int:
     for ch in changes:
-        if ch.get("key") == "agent.max-iterations":
+        if _change_key(ch) == "agent.max-iterations":
             return int(ch["value"])
     return 1000
+
+
+def revertable_changes(previous: list[dict], target_iterations: int | None) -> list[dict]:
+    """Previous values that are safe to put back. A shorter horizon is not."""
+    kept: list[dict] = []
+    for ch in previous:
+        if not isinstance(ch, dict):
+            continue
+        key = _change_key(ch)
+        value = ch.get("value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if (
+            key == "agent.max-iterations"
+            and target_iterations is not None
+            and float(value) < float(target_iterations)
+        ):
+            continue
+        kept.append({"key": key, "value": value})
+    return kept
+
+
+def maybe_revert(cfg: Config, state: dict, run: Run, m: Metrics, exp: dict,
+                 it: int, apply: bool) -> dict | None:
+    """One automatic undo if the post-change window is worse on falls and reward.
+
+    The decision is rules-only. A second undo of the same change is refused and
+    the experiment is marked needs_human. Revert uses one budget slot.
+    """
+    if exp.get("needs_human"):
+        return None
+    originals = [
+        inv for inv in (exp.get("interventions") or [])
+        if inv.get("kind") != "revert" and inv.get("snapshot") and inv.get("changes")
+    ]
+    if not originals:
+        return None
+    inv = originals[-1]
+    outcome = inv.get("outcome")
+    if outcome in ("ok", "revert_failed"):
+        return None
+    base_iter = inv.get("iter")
+    if not isinstance(base_iter, int):
+        return None
+    snap = inv.get("snapshot")
+    if not isinstance(snap, dict):
+        return None
+
+    if outcome == "reverted":
+        rev_iter = inv.get("reverted_at_iter")
+        if not isinstance(rev_iter, int) or it - rev_iter < cfg.monitor.cooldown_iters:
+            return None
+        if window_worse(m, snap, rev_iter + 1, it):
+            exp["needs_human"] = True
+            exp["needs_human_reason"] = (
+                "revert did not recover fell_over and mean_reward; "
+                "leaving the run for a human"
+            )
+            inv["post_revert_judged"] = True
+            save_state(state)
+            log.error("%s", exp["needs_human_reason"])
+            return {
+                "status": "needs_human",
+                "verdict": "keep",
+                "diagnosis": exp["needs_human_reason"],
+            }
+        inv["post_revert_judged"] = True
+        inv["outcome"] = "ok"
+        save_state(state)
+        return None
+
+    if outcome not in (None, "pending"):
+        return None
+    if it - base_iter < cfg.monitor.cooldown_iters:
+        return None
+    if not window_worse(m, snap, base_iter + 1, it):
+        inv["outcome"] = "ok"
+        save_state(state)
+        return None
+
+    diagnosis = (
+        f"reverting changes from iter {base_iter}: fell_over mean rose and "
+        "mean_reward fell versus the pre-change snapshot"
+    )
+    if not apply:
+        return {"status": "revert_recommended", "verdict": "adjust", "diagnosis": diagnosis}
+    if exp.get("budget_used", 0) >= cfg.monitor.max_interventions:
+        exp["needs_human"] = True
+        exp["needs_human_reason"] = "revert needed but intervention budget is exhausted"
+        inv["outcome"] = "revert_failed"
+        save_state(state)
+        return {
+            "status": "needs_human",
+            "verdict": "adjust",
+            "diagnosis": exp["needs_human_reason"],
+        }
+    kept = revertable_changes(inv.get("previous") or [], exp.get("target_iterations"))
+    if not kept:
+        exp["needs_human"] = True
+        exp["needs_human_reason"] = "regression after a change that cannot be auto-reverted"
+        inv["outcome"] = "revert_failed"
+        save_state(state)
+        return {
+            "status": "needs_human",
+            "verdict": "adjust",
+            "diagnosis": exp["needs_human_reason"],
+        }
+    rec = {
+        "verdict": "adjust",
+        "confidence": 1.0,
+        "diagnosis": diagnosis,
+        "evidence": [
+            f"snapshot iter={snap.get('iter')} reward={snap.get('mean_reward')} "
+            f"fell_over={snap.get('fell_over')}",
+        ],
+        "changes": kept,
+        "notes": "rules revert; a second revert will not be attempted",
+        "kind": "revert",
+    }
+    applied = do_intervention(rec, run, cfg, state, phase="monitoring")
+    if applied.get("status") in ("applied", "ready_to_apply"):
+        inv["outcome"] = "reverted"
+        inv["reverted"] = True
+        inv["reverted_at_iter"] = it
+        exp["budget_used"] = exp.get("budget_used", 0) + 1
+        exp["last_intervention_iter"] = it
+        save_state(state)
+        return {"status": "reverted", "verdict": "adjust", "diagnosis": diagnosis, "rec": applied}
+    inv["outcome"] = "revert_failed"
+    exp["needs_human"] = True
+    exp["needs_human_reason"] = f"revert did not apply ({applied.get('status')})"
+    save_state(state)
+    return {
+        "status": "needs_human",
+        "verdict": "adjust",
+        "diagnosis": exp["needs_human_reason"],
+        "rec": applied,
+    }
 
 
 # --------------------------------------------------------------------------- phases
@@ -1508,6 +1958,8 @@ def monitoring_phase(cfg: Config, state: dict, run: Run, force: bool, approve: b
     if m is None or m.iters < 1:
         return {"status": "no_metrics"}
 
+    if settle_smoke(cfg, state):
+        log.warning("stale intervening flag cleared; continuing this cycle")
     if state.get("intervening"):
         return {"status": "intervening"}
     it = m.iters
@@ -1545,21 +1997,56 @@ def monitoring_phase(cfg: Config, state: dict, run: Run, force: bool, approve: b
         save_state(state)
         return {"status": "critical_stopped", "rec": rec}
 
+    revert = maybe_revert(cfg, state, run, m, exp, it, apply)
+    if revert is not None:
+        save_state(state)
+        return sched(revert)
+
+    plateau = plateau_report(m, cfg)
+    if not should_consult_llm("monitoring", findings, plateau):
+        rec = rules_keep(m, cfg, it)
+        exp["last_verdict"] = "keep"
+        exp["last_diagnosis"] = rec["diagnosis"]
+        exp.pop("last_error", None)
+        write_rec(dict(rec, run=str(run.dir), iter=it,
+                       time=datetime.now(timezone.utc).isoformat()),
+                  datetime.now().strftime("%Y%m%d-%H%M%S") + "-keep")
+        save_state(state)
+        log.info("rules keep run=%s iter=%d (LLM skipped)", run.dir.name, it)
+        return sched({
+            "status": "rules_keep",
+            "verdict": "keep",
+            "diagnosis": rec["diagnosis"],
+            "llm_s": 0,
+        })
+
     payload = build_payload(run, m, env_cfg, agent_cfg, findings, state, cfg, "monitoring")
+    t0 = time.perf_counter()
     rec = llm_analyze(cfg, payload)
+    llm_s = round(time.perf_counter() - t0, 3)
+    log.info("llm_analyze took %.1fs", llm_s)
     if rec is None:
         exp["last_error"] = "llm_unavailable"
         save_state(state)
-        return {"status": "llm_unavailable"}
+        return {"status": "llm_unavailable", "llm_s": llm_s}
     exp.pop("last_error", None)
     rec.setdefault("verdict", "keep")
     exp["last_verdict"] = rec["verdict"]
     exp["last_diagnosis"] = rec.get("diagnosis")
     save_state(state)
 
-    ok, errors = validate_rec(rec, cfg)
+    ok, errors = validate_rec(rec, cfg, target_iterations=exp.get("target_iterations"))
     result: dict = {"status": "analyzed", "verdict": rec["verdict"],
-                    "diagnosis": rec.get("diagnosis"), "errors": errors}
+                    "diagnosis": rec.get("diagnosis"), "errors": errors, "llm_s": llm_s}
+
+    if exp.get("needs_human") and rec.get("verdict") == "adjust" and apply:
+        result["status"] = "needs_human"
+        write_rec(dict(rec, errors=errors, run=str(run.dir), iter=it,
+                       time=datetime.now(timezone.utc).isoformat(), status="needs_human"),
+                  datetime.now().strftime("%Y%m%d-%H%M%S") + "-human")
+        save_state(state)
+        log.error("adjust suppressed: %s", exp.get("needs_human_reason"))
+        return sched(result)
 
     if rec["verdict"] == "abort" and apply:
         result["rec"] = do_intervention(rec, run, cfg, state, phase="monitoring")
@@ -1608,6 +2095,8 @@ def post_run_phase(cfg: Config, state: dict, run: Run, force: bool = False,
         return {"status": "already_planned"}
     if run.dir.name in exp["completed_runs"]:
         return {"status": "completed"}
+    if settle_smoke(cfg, state):
+        log.warning("stale intervening flag cleared before post_run")
     if state.get("intervening"):
         return {"status": "intervening"}
 
@@ -1626,12 +2115,16 @@ def post_run_phase(cfg: Config, state: dict, run: Run, force: bool = False,
              [(f.code, f.severity) for f in findings])
     payload = build_payload(run, m, env_cfg, agent_cfg, findings, state, cfg, "post_run")
 
-    # the run is over — never "stop" it, only plan
+    # the run is over — never "stop" it, only plan. post_run always consults
+    # the model: the rules cannot decide done vs continue vs change.
+    t0 = time.perf_counter()
     rec = llm_analyze(cfg, payload)
+    llm_s = round(time.perf_counter() - t0, 3)
+    log.info("llm_analyze took %.1fs", llm_s)
     if rec is None:
         exp["last_error"] = "llm_unavailable"
         save_state(state)
-        return {"status": "llm_unavailable"}
+        return {"status": "llm_unavailable", "llm_s": llm_s}
     rec.setdefault("verdict", "keep")
     exp["last_verdict"] = rec["verdict"]
     exp["last_diagnosis"] = rec.get("diagnosis")
@@ -1639,7 +2132,7 @@ def post_run_phase(cfg: Config, state: dict, run: Run, force: bool = False,
     save_state(state)
 
     result: dict = {"status": "planned", "verdict": rec["verdict"],
-                    "diagnosis": rec.get("diagnosis")}
+                    "diagnosis": rec.get("diagnosis"), "llm_s": llm_s}
     if approve is False:
         # plan-only mode: persist the recommendation for `autopilot apply`
         rec_path = write_rec(dict(rec, run=str(run.dir), phase="post_run",
@@ -1684,6 +2177,7 @@ class SessionReport:
         self.path = REPORTS_DIR / f"session-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
         self.started = time.time()
         self.counts: dict[str, int] = {}
+        self.llm_s = 0.0
         self._last_hb = time.time()
         self._write(
             f"# Autopilot session {datetime.now().isoformat(timespec='seconds')}\n\n"
@@ -1705,6 +2199,11 @@ class SessionReport:
 
     def note_cycle(self, status: dict) -> None:
         """Record a wake result; skip routine ones, keep an hourly heartbeat."""
+        llm_s = status.get("llm_s")
+        if isinstance(llm_s, (int, float)) and not isinstance(llm_s, bool) and llm_s:
+            self.llm_s += float(llm_s)
+        if status.get("intervening_cleared"):
+            self.event("intervening_cleared", str(status["intervening_cleared"]))
         st = status.get("status") or status.get("phase") or "?"
         if st in _QUIET_STATUSES:
             if time.time() - self._last_hb >= 3600 and status.get("sec_per_iter"):
@@ -1742,6 +2241,8 @@ class SessionReport:
             parts.append(f"eta={status['eta_s']}s")
         if status.get("sleep_s") is not None:
             parts.append(f"sleep={status['sleep_s']}s")
+        if isinstance(llm_s, (int, float)) and not isinstance(llm_s, bool):
+            parts.append(f"llm={float(llm_s):.1f}s")
         self.event(st, " ".join(str(p) for p in parts))
 
     def finish(self, stop_reason: str) -> None:
@@ -1750,6 +2251,7 @@ class SessionReport:
             f"\n## Summary\n\n"
             f"- duration: {(time.time() - self.started) / 3600:.2f} h, stopped: {stop_reason}\n"
             f"- events: {counts}\n"
+            f"- llm time: {self.llm_s:.1f}s\n"
         )
 
 
@@ -1779,8 +2281,12 @@ def cmd_run(cfg: Config) -> int:
         try:
             state = load_state()
             status = {"time": datetime.now(timezone.utc).isoformat()}
+            cleared = settle_smoke(cfg, state)
+            if cleared:
+                status["intervening_cleared"] = cleared
             if state.get("intervening"):
                 status["phase"] = "intervening"
+                status["status"] = "intervening"
             else:
                 status.update(_cycle_once(cfg, state) or {})
             save_json(STATUS_FILE, status)

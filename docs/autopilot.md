@@ -64,9 +64,13 @@ Everything deterministic is computed in `build_analysis()`:
 
 The LLM receives this + the reward table + allowlist/ranges + intervention
 history and must return STRICT JSON: `verdict`, `confidence`, `diagnosis`,
-`evidence`, `changes[]`, `notes`. Thinking is disabled for the local model —
+`evidence`, `changes[]`, `notes`. On a live run the model is asked only when
+the rules engine already raised a finding or the plateau detector fired;
+a quiet run records `keep` without a model call (`status: rules_keep`,
+`llm_s: 0`). `post_run` always asks. Thinking is disabled for the local model —
 its reasoning block otherwise consumed `max_tokens` and the JSON never
-arrived. On unparseable output it is re-asked once with a reminder.
+arrived. On unparseable output it is re-asked once with a reminder. Session
+reports accumulate seconds spent inside `llm_analyze`.
 
 ## Safety (what the LLM can and cannot do)
 
@@ -76,9 +80,16 @@ arrived. On unparseable output it is re-asked once with a reminder.
   those are `AGENTS.md` invariants; ideas about them go into `notes`.
 - `safety.ranges` bounds each value; `max_changes` caps the count;
   `confidence_min` gates auto-apply. Rejected recs are stored with `errors`.
+  `agent.max-iterations` may not go below the experiment's recorded
+  `target_iterations` — shortening a plan is a hand edit.
 - Every change is **smoke-tested first** (64 envs, 5 iters, AGENTS.md rule):
   traceback / nan_state / non-finite reward / timeout → `smoke_failed`, the
-  live run is untouched.
+  live run is untouched. The pre-change point (`mean_reward`, episode length,
+  `fell_over`, entropy) is stored on the intervention. After `cooldown_iters`,
+  if the following window has both more falls and a lower reward, the rules
+  engine reverts the previous allowlisted values once (same smoke → resume,
+  one budget slot). A second revert is not attempted: the experiment is
+  marked `needs_human` and further auto-applies are suppressed.
 - Intervention budget per experiment (`max_interventions`), a cooldown of
   `cooldown_iters` between interventions, and `min_iters_before_intervene`
   (never touch a young run).
@@ -89,6 +100,11 @@ arrived. On unparseable output it is re-asked once with a reminder.
 - Resume always pins `--agent.load-run <dir> --agent.load-checkpoint
   model_N.pt --agent.resume True` — the default `load_run: .*` regex would
   otherwise accept an older run's checkpoint with the same number.
+- The launch command used for that resume is recovered, in order, from the
+  experiment's `last_argv`, from `wandb-metadata.json` whose `output.log`
+  names the run directory, then from the scenario catalog keyed by the
+  experiment folder name. A dead run the daemon never saw can still be
+  relaunched.
 
 ## Verdict semantics by phase
 
@@ -195,9 +211,13 @@ Linger is enabled, so the unit survives logout.
 
 ## Known operational caveats
 
-- A daemon restart mid-intervention leaves `intervening: true` in state if it
-  was SIGKILLed during a smoke test; clear it (`state.json` →
-  `intervening: false`) or the daemon parks in `phase: intervening`.
-- `exp.target_iterations` is set once (first analysis) and only rewritten by a
-  plan-extending change; hand-editing `state.json` while a cycle is mid-flight
-  can be overwritten by that cycle's `save_state`.
+- A smoke test sets `intervening: true` with `intervening_since`. The flag
+  is cleared when the smoke returns, including on an exception, and any
+  recommendation left at `smoking` is closed. If the daemon is killed
+  mid-smoke, the next cycle keeps the flag until `smoke_timeout_s` and then
+  clears it, marking those recommendations `smoke_failed`. Smoking files older
+  than that timeout are closed on the next cycle even when the flag is already
+  down. A fresh flag still parks the cycle so a second smoke cannot start.
+- `exp.target_iterations` is set once (first analysis) and only rewritten by
+  a plan-extending change that does not shorten it; hand-editing `state.json`
+  while a cycle is mid-flight can be overwritten by that cycle's `save_state`.
