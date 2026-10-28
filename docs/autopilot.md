@@ -99,19 +99,60 @@ arrived. On unparseable output it is re-asked once with a reminder.
 
 ## Commands
 
-`PY=../microduck_rl/.venv/bin/python` (mjlab venv —
-supplies tensorboard/yaml for the analytics):
+There is a wrapper on PATH (`~/.local/bin/autopilot`) so you can call
+`autopilot <cmd>` from anywhere; bash aliases (`ap`, `aps`, `apl`, `apup`,
+`apdown`, `apst`, `aplog`, `aplaunch`) live in `~/.bash_aliases`. Under the
+hood it runs the mjlab venv python (supplies tensorboard/yaml for the
+analytics), i.e. `PY=../microduck_rl/.venv/bin/python`:
 
 ```bash
-$PY autopilot.py status          # runs, cycle, last rec
-$PY autopilot.py suggest --force             # one-shot monitoring analysis
-$PY autopilot.py plan --force --recommend-only  # plan an ended run, DO NOT apply
-$PY autopilot.py plan --force                # plan + apply (auto mode)
-$PY autopilot.py apply REC.json               # validate+smoke+stop+relaunch for a saved rec
-$PY autopilot.py launch                       # start train.command
-$PY autopilot.py reset [--experiment NAME]    # clear budget/completed marks
-$PY autopilot.py run                          # daemon (systemd runs this)
+autopilot status               # runs, queue, cycle, last rec
+autopilot scenarios            # list the scenario catalog + queue state
+autopilot suggest --force      # one-shot monitoring analysis
+autopilot plan --force --recommend-only  # plan an ended run, DO NOT apply
+autopilot plan --force         # plan + apply (auto mode)
+autopilot apply REC.json       # validate+smoke+stop+relaunch for a saved rec
+autopilot launch [SCENARIO]    # start a named scenario (or default/train.command)
+autopilot reset [--experiment NAME] [--queue]  # clear budget/completed marks (+ queue)
+autopilot run                  # daemon (systemd runs this)
 ```
+
+## Training scenarios (the whole policy family)
+
+`autopilot scenarios` lists every training scenario the autopilot can run.
+Each maps a friendly name to a task id in the mjlab registry (`uv run
+list-envs`): locomotion (`velocity`, `velstand` + `-rough`), posture/episodic
+(`standup`, `sitstand`), tricks (`groundpick`, `ballkick`, `roulade`), the
+roller-skate family (`rollers`, `swizzle`, `roller-crouch`, `roller-slope`,
+`roller-standup`, `spin`), and every `-Backlash-` A/B twin. 33 scenarios by
+default, all verified against the live registry.
+
+Each scenario supports:
+
+- `task` (required) — the registered task id.
+- `args` — overrides `train.scenario_args` (default `--env.scene.num-envs 4096`).
+- `max_iterations` — pins the plan length (adds `--agent.max-iterations`).
+- `env` — extra environment variables for that scenario only.
+- `warm_start_from` — a run dir: loads its LATEST checkpoint with
+  `MICRODUCK_WARM_START=1` (weights/normalizer/optimizer kept, step-based
+  curricula reset — the AGENTS.md warm-start ≠ resume rule).
+
+Launch one by hand with `autopilot launch velstand`, or chain a training
+program with the queue:
+
+```toml
+[train]
+default_scenario = "velocity"
+queue = ["velocity", "velstand", "standup", "sitstand"]  # walked when idle
+```
+
+With `auto.start_if_idle = true`, the daemon walks `queue` one scenario at a
+time: it launches the first not-yet-done scenario, supervises it through the
+normal monitoring/post-run cycle, and when the plan completes it marks the
+scenario done and moves to the next. An `abort` verdict parks that scenario
+(so it is NOT auto-relaunched); `autopilot reset --queue` clears the
+progress. The queue state lives in `state.json` under `queue`
+(`completed` / `current` / `aborted`) and is shown in `status`.
 
 Notes:
 

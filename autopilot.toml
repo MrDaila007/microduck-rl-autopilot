@@ -37,8 +37,16 @@ max_interventions = 6          # budget per experiment, then human only
 confidence_min = 0.6           # LLM confidence required to auto-apply
 
 [train]
-# First-launch command (used by `autopilot launch` / start_if_idle).
+# First-launch command (legacy; scenarios below take precedence when set).
 command = "uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 4096"
+# Default scenario for `autopilot launch` with no argument.
+default_scenario = "velocity"
+# Shared args appended to every scenario launch (override per scenario).
+scenario_args = ["--env.scene.num-envs", "4096"]
+# Ordered training queue: the daemon walks it when idle (needs
+# auto.start_if_idle=true). A scenario is "done" when its plan completes;
+# an abort parks it (reset --queue re-enables). Empty = never auto-chain.
+queue = []
 smoke_envs = 64                # AGENTS.md smoke test
 smoke_iters = 5
 smoke_timeout_s = 1200
@@ -50,6 +58,115 @@ save_interval = 50             # set on every relaunch: rsl_rl only saves a
 # adds WANDB_MODE=offline only when there are no wandb credentials; with
 # ~/.netrc present, runs log to the dashboard and tfevents feed the analysis.
 [train.env]
+
+# --- scenario catalog (mjlab task registry, one entry per policy family) ---
+# task = registered task id; args (optional) overrides scenario_args;
+# max_iterations (optional) pins the plan length; env (optional) adds env;
+# warm_start_from (optional) = run dir: loads its LATEST checkpoint with
+# MICRODUCK_WARM_START=1 (weights kept, curricula reset — AGENTS.md).
+# Locomotion
+[train.scenarios.velocity]
+task = "Mjlab-Velocity-Flat-MicroDuck"
+
+[train.scenarios.velocity-rough]
+task = "Mjlab-Velocity-Rough-MicroDuck"
+
+[train.scenarios.velstand]
+task = "Mjlab-VelStand-Flat-MicroDuck"
+
+[train.scenarios.velstand-rough]
+task = "Mjlab-VelStand-Rough-MicroDuck"
+
+# Posture / episodic
+[train.scenarios.standup]
+task = "Mjlab-StandUp-Flat-MicroDuck"
+
+[train.scenarios.standup-rough]
+task = "Mjlab-StandUp-Rough-MicroDuck"
+
+[train.scenarios.sitstand]
+task = "Mjlab-SitStand-Flat-MicroDuck"
+
+[train.scenarios.sitstand-rough]
+task = "Mjlab-SitStand-Rough-MicroDuck"
+
+# Manipulation / dynamic tricks
+[train.scenarios.groundpick]
+task = "Mjlab-GroundPick-Flat-MicroDuck"
+
+[train.scenarios.groundpick-rough]
+task = "Mjlab-GroundPick-Rough-MicroDuck"
+
+[train.scenarios.ballkick]
+task = "Mjlab-BallKick-Flat-MicroDuck"
+
+[train.scenarios.roulade]
+task = "Mjlab-Roulade-Flat-MicroDuck"
+
+# Roller-skate family
+[train.scenarios.rollers]
+task = "Mjlab-Velocity-Flat-MicroDuck-Rollers"
+
+[train.scenarios.swizzle]
+task = "Mjlab-Velocity-Swizzle-MicroDuck"
+
+[train.scenarios.roller-crouch]
+task = "Mjlab-RollerCrouch-Flat-MicroDuck"
+
+[train.scenarios.roller-slope]
+task = "Mjlab-RollerSlope-Flat-MicroDuck"
+
+[train.scenarios.roller-standup]
+task = "Mjlab-RollerStandUp-Flat-MicroDuck"
+
+[train.scenarios.spin]
+task = "Mjlab-Spin-Flat-MicroDuck"
+
+# Backlash twins (A/B the ±1° gear-play model; same training recipe)
+[train.scenarios.velocity-backlash]
+task = "Mjlab-Velocity-Flat-Backlash-MicroDuck"
+
+[train.scenarios.velocity-rough-backlash]
+task = "Mjlab-Velocity-Rough-Backlash-MicroDuck"
+
+[train.scenarios.velstand-backlash]
+task = "Mjlab-VelStand-Flat-Backlash-MicroDuck"
+
+[train.scenarios.velstand-rough-backlash]
+task = "Mjlab-VelStand-Rough-Backlash-MicroDuck"
+
+[train.scenarios.standup-backlash]
+task = "Mjlab-StandUp-Flat-Backlash-MicroDuck"
+
+[train.scenarios.standup-rough-backlash]
+task = "Mjlab-StandUp-Rough-Backlash-MicroDuck"
+
+[train.scenarios.sitstand-backlash]
+task = "Mjlab-SitStand-Flat-Backlash-MicroDuck"
+
+[train.scenarios.sitstand-rough-backlash]
+task = "Mjlab-SitStand-Rough-Backlash-MicroDuck"
+
+[train.scenarios.groundpick-backlash]
+task = "Mjlab-GroundPick-Flat-Backlash-MicroDuck"
+
+[train.scenarios.groundpick-rough-backlash]
+task = "Mjlab-GroundPick-Rough-Backlash-MicroDuck"
+
+[train.scenarios.ballkick-backlash]
+task = "Mjlab-BallKick-Flat-Backlash-MicroDuck"
+
+[train.scenarios.rollers-backlash]
+task = "Mjlab-Velocity-Flat-Backlash-MicroDuck-Rollers"
+
+[train.scenarios.swizzle-backlash]
+task = "Mjlab-Velocity-Swizzle-Backlash-MicroDuck"
+
+[train.scenarios.roller-crouch-backlash]
+task = "Mjlab-RollerCrouch-Flat-Backlash-MicroDuck"
+
+[train.scenarios.roller-slope-backlash]
+task = "Mjlab-RollerSlope-Flat-Backlash-MicroDuck"
 
 [safety]
 # What the LLM may change (tyro CLI spellings, fnmatch patterns).

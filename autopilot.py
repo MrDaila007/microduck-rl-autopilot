@@ -17,14 +17,21 @@ A wake/sleep cycle around a local mjlab/rsl_rl run:
 The heavy lifting is done by the analytics block below so the local LLM only
 has to judge and plan, not compute. See docs/autopilot.md.
 
+The [train.scenarios] table in autopilot.toml maps friendly names to any
+task in the mjlab registry (velocity, velstand, standup, sitstand,
+groundpick, ballkick, rollers, swizzle, roller_*, spin, roulade + their
+-Backlash- twins). auto.start_if_idle walks the optional [train] queue
+through them, one completed scenario at a time.
+
 Commands:
-  status                     detected runs, state, last recommendation
+  status                     detected runs, state, queue, last recommendation
+  scenarios                  list configured training scenarios + queue
   suggest [--force] [--approve]   one-shot analysis of the ACTIVE run
   plan [--force]             one-shot post-run planning for the newest ended run
   run                        daemon loop (systemd: microduck-rl-autopilot)
   apply REC.json             validate + smoke-test + restart for a saved rec
-  launch                     start the configured training command
-  reset [--experiment X]     clear the intervention budget / completed marks
+  launch [SCENARIO]          start a named scenario (or default/train.command)
+  reset [--experiment X] [--queue]  clear budget/completed marks (+ queue)
 """
 
 from __future__ import annotations
@@ -115,6 +122,10 @@ class SafetyCfg:
 @dataclass
 class TrainCfg_:
     command: str = ""
+    default_scenario: str = ""
+    scenario_args: list[str] = field(default_factory=lambda: ["--env.scene.num-envs", "4096"])
+    scenarios: dict[str, dict] = field(default_factory=dict)
+    queue: list[str] = field(default_factory=list)
     smoke_envs: int = 64
     smoke_iters: int = 5
     smoke_timeout_s: int = 1200
@@ -231,6 +242,95 @@ def train_env(cfg: Config) -> dict[str, str]:
     if "WANDB_MODE" not in env and not wandb_has_creds():
         env["WANDB_MODE"] = "offline"
     return env
+
+
+# ----------------------------------------------------------------------- scenarios
+#
+# The mjlab registry holds the whole policy family (velocity, velstand,
+# standup, sitstand, groundpick, ballkick, rollers, swizzle, roller_*,
+# spin, roulade + their -Backlash- twins). autopilot.toml maps friendly
+# names to task ids so ONE autopilot can supervise any of them and walk a
+# training queue (velocity -> velstand -> ...) while idle.
+
+
+def scenario_spec(cfg: Config, name: str) -> dict | None:
+    return (cfg.train.scenarios or {}).get(name)
+
+
+def scenario_launch(cfg: Config, name: str) -> tuple[list[str], dict[str, str]] | None:
+    """argv + extra env for a named scenario, or None if unknown/broken."""
+    spec = scenario_spec(cfg, name)
+    if not spec or not spec.get("task"):
+        return None
+    args = [str(a) for a in (spec.get("args") or cfg.train.scenario_args)]
+    argv = ["uv", "run", "train", str(spec["task"]), *args]
+    if spec.get("max_iterations"):
+        argv += ["--agent.max-iterations", str(int(spec["max_iterations"]))]
+    env = {str(k): str(v) for k, v in (spec.get("env") or {}).items()}
+    warm = spec.get("warm_start_from")
+    if warm:
+        # Warm start != resume: load weights/normalizer/optimizer but restart
+        # step-based curricula (AGENTS.md) — no --agent.resume, and
+        # MICRODUCK_WARM_START=1 tells mjlab to zero the step counter.
+        run_dir = Path(warm)
+        if not run_dir.is_absolute():
+            run_dir = MJLAB_REPO / run_dir
+        ckpts = sorted(run_dir.glob("model_*.pt"), key=lambda p: p.stat().st_mtime)
+        if not ckpts:
+            log.error("scenario %s: no checkpoint in %s", name, run_dir)
+            return None
+        argv += ["--agent.load-run", str(run_dir),
+                 "--agent.load-checkpoint", ckpts[-1].name]
+        env.setdefault("MICRODUCK_WARM_START", "1")
+    return argv, env
+
+
+def queue_next(cfg: Config, state: dict) -> str | None:
+    """First queued scenario that has not completed (and was not aborted)."""
+    q = state.get("queue") or {}
+    done = set(q.get("completed", []))
+    aborted = set(q.get("aborted", []))
+    for name in cfg.train.queue or []:
+        if name not in done and name not in aborted and scenario_spec(cfg, name):
+            return name
+    return None
+
+
+def queue_note_abort(cfg: Config, state: dict, argv: list[str] | None) -> None:
+    """An abort verdict on a queued scenario: park it (human decides)."""
+    if not argv or not cfg.train.queue:
+        return
+    for name in cfg.train.queue:
+        spec = scenario_spec(cfg, name)
+        if spec and spec.get("task") and str(spec["task"]) in argv:
+            q = state.setdefault("queue", {"completed": []})
+            q.setdefault("aborted", [])
+            if name not in q["aborted"]:
+                q["aborted"].append(name)
+            if q.get("current") == name:
+                q["current"] = None
+            save_state(state)
+            log.warning("queue: scenario %s aborted — will not auto-relaunch "
+                        "(reset --queue to re-enable)", name)
+            return
+
+
+def queue_note_completion(cfg: Config, state: dict, argv: list[str] | None) -> None:
+    """A run finished — if it was launched for a queued scenario, mark it done."""
+    if not argv or not cfg.train.queue:
+        return
+    for name in cfg.train.queue:
+        spec = scenario_spec(cfg, name)
+        if spec and spec.get("task") and str(spec["task"]) in argv:
+            q = state.setdefault("queue", {"completed": []})
+            if name not in q.setdefault("completed", []):
+                q["completed"].append(name)
+            if q.get("current") == name:
+                q["current"] = None
+            save_state(state)
+            log.info("queue: scenario %s completed (%d/%d done)",
+                     name, len(q["completed"]), len(cfg.train.queue))
+            return
 
 
 # --------------------------------------------------------------------------- runs
@@ -1255,6 +1355,8 @@ def do_intervention(rec: dict, run: Run, cfg: Config, state: dict,
         if not prog.get("remaining_to_target"):
             record["status"] = "plan_completed"
             exp["completed_runs"].append(run.dir.name)
+            queue_note_completion(cfg, state,
+                                  exp.get("last_argv") or state.get("last_train_argv"))
             save_json(rec_path, record)
             log.info("run %s: plan completed (%s)", run.dir.name, rec.get("diagnosis", "")[:200])
             return record
@@ -1272,6 +1374,7 @@ def do_intervention(rec: dict, run: Run, cfg: Config, state: dict,
         else:
             record["status"] = "abort_recommended"
         exp["last_verdict"] = "abort"
+        queue_note_abort(cfg, state, exp.get("last_argv") or state.get("last_train_argv"))
         save_json(rec_path, record)
         log.warning("ABORT verdict: %s", rec.get("diagnosis"))
         return record
@@ -1613,8 +1716,12 @@ class SessionReport:
                 )
             return
         parts = [f"phase={status.get('phase', '?')}"]
+        if status.get("scenario"):
+            parts.append(f"scenario={status['scenario']}")
         if status.get("run"):
             parts.append(f"run={status['run']}")
+        if status.get("argv"):
+            parts.append(f"argv: {status['argv']}")
         if status.get("verdict"):
             parts.append(f"verdict={status['verdict']}")
         if status.get("diagnosis"):
@@ -1721,16 +1828,43 @@ def _cycle_once(cfg: Config, state: dict) -> dict:
             out["run"] = newest.dir.name
             return out
 
-    if cfg.auto.start_if_idle and cfg.train.command:
+    if cfg.auto.start_if_idle and (cfg.train.queue or cfg.train.scenarios or cfg.train.command):
         import shlex
 
         if not find_train_proc(state):
-            argv = shlex.split(cfg.train.command)
+            # queue mode: walk the scenario list; single mode: default
+            # scenario, else the raw command (back-compat).
+            scenario = queue_next(cfg, state)
+            extra_env: dict[str, str] = {}
+            if scenario:
+                launch = scenario_launch(cfg, scenario)
+                if launch is None:
+                    log.error("queue: scenario %s misconfigured (no task?)", scenario)
+                    return {"phase": "idle", "run": None}
+                argv, extra_env = launch
+            else:
+                name = cfg.train.default_scenario
+                launch = scenario_launch(cfg, name) if name else None
+                if launch is not None:
+                    argv, extra_env = launch
+                elif cfg.train.command:
+                    argv = shlex.split(cfg.train.command)
+                else:
+                    return {"phase": "idle", "run": None}
             if argv:
-                pid = spawn(argv, MJLAB_REPO, STATE_DIR / "train-autolaunch.log", train_env(cfg))
+                log_file = STATE_DIR / f"train-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+                pid = spawn(argv, MJLAB_REPO, log_file,
+                            {**train_env(cfg), **extra_env})
                 state["last_train_argv"] = argv
+                if scenario:
+                    q = state.setdefault("queue", {"completed": []})
+                    q["current"] = scenario
                 save_state(state)
-                return {"phase": "idle", "action": "launched", "pid": pid}
+                log.info("launched%s pid=%d: %s",
+                         f" scenario={scenario}" if scenario else "", pid, " ".join(argv))
+                return {"phase": "idle", "status": "launched", "pid": pid,
+                        "scenario": scenario or cfg.train.default_scenario or None,
+                        "argv": " ".join(argv)}
     return {"phase": "idle", "run": None}
 
 
@@ -1756,6 +1890,14 @@ def cmd_status(cfg: Config) -> int:
     proc = find_train_proc(state)
     print(f"training process: {proc['pid'] if proc else 'none'}")
     print(f"intervening: {state.get('intervening')}")
+    q = state.get("queue") or {}
+    if cfg.train.queue:
+        done = set(q.get("completed", []))
+        aborted = set(q.get("aborted", []))
+        nxt = queue_next(cfg, state)
+        print(f"scenario queue ({len(done)}/{len(cfg.train.queue)} done): "
+              f"current={q.get('current')} next={nxt}"
+              + (f" aborted={sorted(aborted)}" if aborted else ""))
     if not runs:
         print("runs: none")
     for r in runs[-6:]:
@@ -1835,25 +1977,68 @@ def cmd_apply(cfg: Config, rec_path: Path) -> int:
                                       "ready_to_apply", "ready_to_relaunch") else 1
 
 
-def cmd_launch(cfg: Config) -> int:
+def cmd_launch(cfg: Config, scenario: str | None) -> int:
     state = load_state()
-    if not cfg.train.command:
-        print("train.command is empty in autopilot.toml", file=sys.stderr)
-        return 2
     import shlex
 
     if find_train_proc(state):
         print("a training process is already running")
         return 1
-    argv = shlex.split(cfg.train.command)
-    pid = spawn(argv, MJLAB_REPO, STATE_DIR / "train-manual.log", train_env(cfg))
+    extra_env: dict[str, str] = {}
+    if scenario:
+        launch = scenario_launch(cfg, scenario)
+        if launch is None:
+            known = ", ".join(sorted(cfg.train.scenarios)) or "(none configured)"
+            print(f"unknown scenario {scenario!r}; known: {known}", file=sys.stderr)
+            return 2
+        argv, extra_env = launch
+    elif cfg.train.default_scenario or cfg.train.scenarios:
+        name = cfg.train.default_scenario or next(iter(cfg.train.scenarios), "")
+        launch = scenario_launch(cfg, name) if name else None
+        if launch is None:
+            if not cfg.train.command:
+                print(f"no default scenario and no train.command", file=sys.stderr)
+                return 2
+            argv = shlex.split(cfg.train.command)
+        else:
+            argv, extra_env = launch
+    elif cfg.train.command:
+        argv = shlex.split(cfg.train.command)
+    else:
+        print("no scenario given and train.command is empty in autopilot.toml",
+              file=sys.stderr)
+        return 2
+    log_file = STATE_DIR / f"train-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+    pid = spawn(argv, MJLAB_REPO, log_file, {**train_env(cfg), **extra_env})
     state["last_train_argv"] = argv
     save_state(state)
-    print(f"launched pid={pid}")
+    print(f"launched pid={pid}: {' '.join(argv)}")
     return 0
 
 
-def cmd_reset(cfg: Config, experiment: str | None) -> int:
+def cmd_scenarios(cfg: Config) -> int:
+    state = load_state()
+    q = state.get("queue") or {}
+    done = set(q.get("completed", []))
+    if not cfg.train.scenarios and not cfg.train.command:
+        print("no scenarios configured (autopilot.toml [train.scenarios])")
+        return 0
+    print(f"default: {cfg.train.default_scenario or '(train.command)'}")
+    if cfg.train.queue:
+        print(f"queue ({len(done)}/{len(cfg.train.queue)} done):")
+        for name in cfg.train.queue:
+            spec = scenario_spec(cfg, name) or {}
+            mark = "done" if name in done else ("running" if q.get("current") == name else "pending")
+            print(f"  [{mark:>7}] {name}: {spec.get('task', '???')}")
+    print("scenarios:")
+    for name, spec in sorted(cfg.train.scenarios.items()):
+        warm = f" (warm start from {spec['warm_start_from']})" if spec.get("warm_start_from") else ""
+        it = f", {spec['max_iterations']} iters" if spec.get("max_iterations") else ""
+        print(f"  {name}: {spec.get('task', '???')}{it}{warm}")
+    return 0
+
+
+def cmd_reset(cfg: Config, experiment: str | None, queue: bool) -> int:
     state = load_state()
     targets = [experiment] if experiment else list(state.get("experiments", {}))
     for name in targets:
@@ -1862,8 +2047,10 @@ def cmd_reset(cfg: Config, experiment: str | None) -> int:
         exp["last_verdict"] = None
         exp["post_runs"] = []
         exp["completed_runs"] = []
+    if queue:
+        state["queue"] = {"completed": [], "current": None}
     save_state(state)
-    print(f"reset: {targets}")
+    print(f"reset: {targets}" + (" + queue" if queue else ""))
     return 0
 
 
@@ -1884,9 +2071,13 @@ def main() -> int:
     sub.add_parser("run")
     p_app = sub.add_parser("apply")
     p_app.add_argument("rec")
-    sub.add_parser("launch")
+    p_lch = sub.add_parser("launch")
+    p_lch.add_argument("scenario", nargs="?", default=None,
+                       help="scenario name from autopilot.toml [train.scenarios]")
+    sub.add_parser("scenarios")
     p_res = sub.add_parser("reset")
     p_res.add_argument("--experiment", default=None)
+    p_res.add_argument("--queue", action="store_true", help="clear scenario queue progress")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1905,9 +2096,11 @@ def main() -> int:
     if args.cmd == "apply":
         return cmd_apply(cfg, Path(args.rec))
     if args.cmd == "launch":
-        return cmd_launch(cfg)
+        return cmd_launch(cfg, args.scenario)
+    if args.cmd == "scenarios":
+        return cmd_scenarios(cfg)
     if args.cmd == "reset":
-        return cmd_reset(cfg, args.experiment)
+        return cmd_reset(cfg, args.experiment, args.queue)
     return 2
 
 
