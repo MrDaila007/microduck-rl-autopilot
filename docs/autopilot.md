@@ -69,7 +69,8 @@ history and must return STRICT JSON: `verdict`, `confidence`, `diagnosis`,
 `evidence`, `changes[]`, `notes`. On a live run the model is asked only when
 the rules engine already raised a finding or the plateau detector fired;
 a quiet run records `keep` without a model call (`status: rules_keep`,
-`llm_s: 0`). `post_run` always asks. Thinking is disabled for the local model —
+`llm_s: 0`), and so does a run whose budget is spent (`status: llm_paused`).
+`post_run` always asks. Thinking is disabled for the local model —
 its reasoning block otherwise consumed `max_tokens` and the JSON never
 arrived. On unparseable output it is re-asked once with a reminder. Session
 reports accumulate seconds spent inside `llm_analyze`.
@@ -95,10 +96,19 @@ reports accumulate seconds spent inside `llm_analyze`.
 - Intervention budget per experiment (`max_interventions`), a cooldown of
   `cooldown_iters` between interventions, and `min_iters_before_intervene`
   (never touch a young run).
-- Stop = SIGINT to the process tree (rsl_rl saves nothing on KeyboardInterrupt
-  → up to `save_interval` iterations can be lost), escalating
-  SIGTERM → SIGKILL. Relaunches always pass `--agent.save-interval 50` to
-  bound that loss.
+- Stop = SIGINT to the trainer process only (rsl_rl saves nothing on
+  KeyboardInterrupt → up to `save_interval` iterations can be lost); a trainer
+  still alive after `stop_grace_s` gets SIGTERM → SIGKILL together with its
+  descendants (wandb-core, gpu_stats). Its parents (uv, a shell, tmux, the
+  daemon, systemd) are never signalled. Relaunches always pass
+  `--agent.save-interval 50` to bound that loss.
+- The revert baseline is the metric snapshot at the checkpoint the relaunch
+  resumes from (`iter`), not the iteration the old run was stopped at
+  (`stopped_at_iter`). A relaunch without a checkpoint has no baseline and is
+  never auto-reverted.
+- With the budget spent or `needs_human` set, an unattended monitoring cycle
+  does not call the LLM (`status: llm_paused`); critical rules still stop the
+  run. `autopilot reset` clears the budget, `needs_human` and the pause.
 - Resume always pins `--agent.load-run <dir> --agent.load-checkpoint
   model_N.pt --agent.resume True` — the default `load_run: .*` regex would
   otherwise accept an older run's checkpoint with the same number.

@@ -36,12 +36,15 @@ temperature = 0.2
 tick_s = 60                    # daemon poll interval
 analyze_every_iters = 5        # consult the LLM every N new iterations
 active_after_s = 300           # run dir with tfevents newer than this = active
-min_iters_before_intervene = 50  # never touch a run younger than this
+min_iters_before_intervene = 500 # never touch a run younger than this
 stagnation_window = 100        # iterations considered by trend rules
 stagnation_min_iters = 200     # stagnation rule only fires after this many
 stagnation_rel_gain = 0.02     # mean_reward gain below this over window = flat
-cooldown_iters = 10            # min iterations between two interventions
-max_interventions = 6          # budget per experiment, then human only
+cooldown_iters = 300           # min iterations between two interventions; also
+                               # the window the revert check judges a change on.
+                               # PPO needs hundreds of iters to answer a reward
+                               # change; the LLM is not asked meanwhile.
+max_interventions = 12         # budget per experiment, then human only
 confidence_min = 0.6           # LLM confidence required to auto-apply
 
 [train]
@@ -189,7 +192,7 @@ allow = [
 # (env.observations.*), robot/actuator cfg and curricula (env.events.*) off
 # limits — those are AGENTS.md invariants, see docs/autopilot.md.
 deny = []
-max_changes = 3
+max_changes = 1                # one change per intervention, so its effect is attributable
 penalty_eps = 0.01             # Episode_Reward/<penalty> above this = sign bug
 
 # Numeric bounds per pattern (also applied to the daemon's own relaunch flags).

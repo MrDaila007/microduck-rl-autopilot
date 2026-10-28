@@ -126,12 +126,12 @@ class MonitorCfg:
     tick_s: int = 60
     analyze_every_iters: int = 5
     active_after_s: int = 300
-    min_iters_before_intervene: int = 50
+    min_iters_before_intervene: int = 500
     stagnation_window: int = 100
     stagnation_min_iters: int = 200
     stagnation_rel_gain: float = 0.02
-    cooldown_iters: int = 10
-    max_interventions: int = 6
+    cooldown_iters: int = 300
+    max_interventions: int = 12
     confidence_min: float = 0.6
     post_run_log_lines: int = 30
     # Wake scheduling: while training runs, sleep is computed from the measured
@@ -148,7 +148,7 @@ class SafetyCfg:
     allow: list[str] = field(default_factory=list)
     deny: list[str] = field(default_factory=list)
     ranges: dict[str, list[float]] = field(default_factory=dict)
-    max_changes: int = 3
+    max_changes: int = 1
     penalty_eps: float = 0.01
 
 
@@ -632,10 +632,11 @@ def _proc_iter():
         pid = int(entry.name)
         try:
             cmdline = [c.decode(errors="replace") for c in (entry / "cmdline").read_bytes().split(b"\0") if c]
-            stat = (entry / "stat").read_text()
-            ppid = int(stat.split(") ", 1)[1].split()[1])
+            # comm (field 2) may itself contain ") ", so split on the LAST one.
+            fields = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
+            ppid = int(fields[1])
+            started = int(fields[19])  # starttime, clock ticks since boot
             cwd = os.readlink(entry / "cwd")
-            started = (entry / "stat").stat().st_mtime
         except (OSError, ValueError, IndexError):
             continue
         yield pid, ppid, cmdline, cwd, started
@@ -644,12 +645,30 @@ def _proc_iter():
 TRAIN_MARKERS = (".venv/bin/train", "mjlab.scripts.train", "scripts/train.py")
 
 
+def _parent_map() -> dict[int, int]:
+    return {pid: ppid for pid, ppid, _c, _w, _s in _proc_iter()}
+
+
+def _descends_from(pid: int, roots: set[int], parents: dict[int, int]) -> bool:
+    seen: set[int] = set()
+    cur = pid
+    while cur > 1 and cur not in seen:
+        if cur in roots:
+            return True
+        seen.add(cur)
+        cur = parents.get(cur, 0)
+    return False
+
+
 def find_train_proc(state: dict | None = None) -> dict | None:
     own = os.getpid()
+    # smoke_pids holds the `uv` wrapper we spawned; the python trainer is its child.
     smoke_pids = set(state.get("smoke_pids", [])) if state else set()
+    procs = list(_proc_iter())
+    parents = {pid: ppid for pid, ppid, _c, _w, _s in procs}
     best = None
-    for pid, ppid, cmdline, cwd, started in _proc_iter():
-        if pid in smoke_pids or pid == own:
+    for pid, ppid, cmdline, cwd, started in procs:
+        if pid == own or (smoke_pids and _descends_from(pid, smoke_pids, parents)):
             continue
         joined = " ".join(cmdline)
         if any(m in joined for m in TRAIN_MARKERS) and not any("autopilot" in c for c in cmdline):
@@ -658,18 +677,20 @@ def find_train_proc(state: dict | None = None) -> dict | None:
     return best
 
 
-def proc_tree_ancestors(pid: int) -> list[int]:
-    out, seen, cur = [], set(), pid
-    while cur > 1 and cur not in seen:
+def proc_tree_descendants(pid: int) -> list[int]:
+    """Children, grandchildren, ... of pid. Never its parents: the trainer's
+    ancestors are uv, a shell, tmux, the daemon or systemd --user."""
+    children: dict[int, list[int]] = {}
+    for child, parent in _parent_map().items():
+        children.setdefault(parent, []).append(child)
+    out, stack, seen = [], list(children.get(pid, [])), {pid}
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
         seen.add(cur)
-        try:
-            stat = Path(f"/proc/{cur}/stat").read_text()
-            cur = int(stat.split(") ", 1)[1].split()[1])
-        except (OSError, ValueError, IndexError):
-            break
-        if cur == os.getpid() or cur <= 1:
-            break
         out.append(cur)
+        stack.extend(children.get(cur, []))
     return out
 
 
@@ -699,13 +720,15 @@ def stop_training(proc: dict, cfg: Config, state: dict) -> None:
     so this can lose up to save_interval iterations — relaunches use a smaller
     save-interval to bound that), escalate SIGTERM/SIGKILL."""
     pid = proc["pid"]
-    pids = [pid] + proc_tree_ancestors(pid)
+    # Children (wandb-core, gpu_stats) sit in their own process group, like on
+    # Ctrl+C: the trainer shuts them down and flushes. Only a stuck trainer
+    # gets its whole tree terminated.
+    pids = [p for p in [pid, *proc_tree_descendants(pid)] if p != os.getpid()]
     log.info("stopping training pid=%s (tree: %s)", pid, pids)
-    for p in pids:
-        try:
-            os.kill(p, signal.SIGINT)
-        except (ProcessLookupError, PermissionError):
-            pass
+    try:
+        os.kill(pid, signal.SIGINT)
+    except (ProcessLookupError, PermissionError):
+        pass
     deadline = time.time() + cfg.train.stop_grace_s
     while _pid_alive(pid) and time.time() < deadline:
         time.sleep(2)
@@ -1290,6 +1313,15 @@ def _relaunch(run: Run, changes: list[dict], cfg: Config, state: dict, record: d
         remaining = max(int(target) - int(done), cfg.train.smoke_iters)
     else:
         remaining = max(m_value(changes), 1000)
+    snap = record.get("snapshot") if isinstance(record.get("snapshot"), dict) else None
+    stopped_at = (snap or {}).get("iter")
+    if snap is not None and snap.get("iter") != done:
+        # The new run starts from model_<done>.pt, not from where the old one
+        # was stopped: the revert check must compare against that policy.
+        # Without a checkpoint it starts from scratch and there is no baseline.
+        measured = Metrics.load(run) if done is not None else None
+        snap = metric_snapshot(measured, done) if measured is not None else None
+        record["snapshot"] = snap
     new_argv = relaunch_argv(argv, change_list, ckpt, run.dir.name, remaining, cfg)
     log_file = STATE_DIR / f"train-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
     new_pid = spawn(new_argv, MJLAB_REPO, log_file, train_env(cfg))
@@ -1299,8 +1331,7 @@ def _relaunch(run: Run, changes: list[dict], cfg: Config, state: dict, record: d
                    "checkpoint": ckpt.name if ckpt else None,
                    "iterations": remaining})
     save_json(rec_path, record)
-    snap = record.get("snapshot") if isinstance(record.get("snapshot"), dict) else None
-    iter_at = done if done is not None else (snap or {}).get("iter")
+    iter_at = done if done is not None else stopped_at
     entry = {
         "time": record["time"],
         "phase": record.get("phase"),
@@ -1308,6 +1339,7 @@ def _relaunch(run: Run, changes: list[dict], cfg: Config, state: dict, record: d
         "previous": record.get("previous") or [],
         "snapshot": snap,
         "iter": iter_at,
+        "stopped_at_iter": stopped_at,
         "rec": str(rec_path),
         "smoke": record.get("smoke"),
         "kind": record.get("kind") or "apply",
@@ -1547,6 +1579,21 @@ def monitoring_phase(cfg: Config, state: dict, run: Run, force: bool, approve: b
             "llm_s": 0,
         })
 
+    paused = llm_pause_reason(cfg, exp, None if force else it) if apply else None
+    if paused:
+        if exp.get("llm_paused") != paused:
+            log.warning("LLM paused for %s: %s (autopilot reset to re-enable)",
+                        run.experiment, paused)
+            exp["llm_paused"] = paused
+        save_state(state)
+        return sched({
+            "status": "llm_paused",
+            "diagnosis": paused,
+            "findings": [f.code for f in findings],
+            "llm_s": 0,
+        })
+    exp.pop("llm_paused", None)
+
     payload = build_payload(run, m, env_cfg, agent_cfg, findings, state, cfg, "monitoring")
     t0 = time.perf_counter()
     rec = llm_analyze(cfg, payload)
@@ -1608,6 +1655,28 @@ def monitoring_phase(cfg: Config, state: dict, run: Run, force: bool, approve: b
 
     save_state(state)
     return sched(result)
+
+
+def llm_pause_reason(cfg: Config, exp: dict, it: int | None = None) -> str | None:
+    """Why an unattended monitoring cycle must not ask the model.
+
+    With no budget left, a human hold, a young run or an open cooldown nothing
+    the model says can be applied, and each call takes GPU time from the
+    trainer. Critical rules still stop the run without the model.
+    """
+    if exp.get("needs_human"):
+        return f"needs_human: {exp.get('needs_human_reason') or 'unspecified'}"
+    used = exp.get("budget_used", 0)
+    if used >= cfg.monitor.max_interventions:
+        return f"intervention budget exhausted ({used}/{cfg.monitor.max_interventions})"
+    if it is None:
+        return None
+    if it < cfg.monitor.min_iters_before_intervene:
+        return f"run too young ({it} < {cfg.monitor.min_iters_before_intervene} iters)"
+    last = exp.get("last_intervention_iter")
+    if isinstance(last, int) and it - last < cfg.monitor.cooldown_iters:
+        return f"cooldown after the change at iter {last} (until {last + cfg.monitor.cooldown_iters})"
+    return None
 
 
 def post_run_phase(cfg: Config, state: dict, run: Run, force: bool = False,
@@ -1706,6 +1775,7 @@ class SessionReport:
         self.counts: dict[str, int] = {}
         self.llm_s = 0.0
         self._last_hb = time.time()
+        self._last_status: str | None = None
         self._write(
             f"# Autopilot session {datetime.now().isoformat(timespec='seconds')}\n\n"
             f"- auto={cfg.auto.enabled} model={cfg.llm.model} "
@@ -1732,7 +1802,9 @@ class SessionReport:
         if status.get("intervening_cleared"):
             self.event("intervening_cleared", str(status["intervening_cleared"]))
         st = status.get("status") or status.get("phase") or "?"
-        if st in _QUIET_STATUSES:
+        repeated_pause = st == "llm_paused" and self._last_status == "llm_paused"
+        self._last_status = st
+        if st in _QUIET_STATUSES or repeated_pause:
             if time.time() - self._last_hb >= 3600 and status.get("sec_per_iter"):
                 self._last_hb = time.time()
                 self.event(
@@ -2154,6 +2226,8 @@ def cmd_reset(cfg: Config, experiment: str | None, queue: bool) -> int:
         exp["last_verdict"] = None
         exp["post_runs"] = []
         exp["completed_runs"] = []
+        for key in ("needs_human", "needs_human_reason", "llm_paused"):
+            exp.pop(key, None)
     if queue:
         state["queue"] = {"completed": [], "current": None}
     save_state(state)

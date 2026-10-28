@@ -6,6 +6,7 @@ import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -334,6 +335,56 @@ def test_revert_flags_human_when_nothing_can_be_undone(tmp_path: Path, monkeypat
     assert inv["outcome"] == "revert_failed"
 
 
+def _relaunch_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                      ckpt: str | None) -> tuple[autopilot.Run, dict, dict]:
+    _isolate_state(monkeypatch, tmp_path)
+    monkeypatch.setattr(autopilot, "STATE_DIR", tmp_path)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    if ckpt:
+        (run_dir / ckpt).write_bytes(b"ckpt")
+    run = autopilot.Run(run_dir, "velocity", "run")
+    m = _metrics(**{
+        "Episode_Termination/fell_over": [(0, 40.0), (240, 5.0)],
+        "Train/mean_reward": [(0, -2.0), (240, 3.0)],
+    })
+    monkeypatch.setattr(autopilot.Metrics, "load", lambda _run: m)
+    monkeypatch.setattr(autopilot, "find_runs", lambda: [run])
+    monkeypatch.setattr(autopilot, "spawn", lambda *a, **k: 4242)
+    state: dict = {"experiments": {"velocity": {"target_iterations": 5000}}}
+    record = {
+        "time": datetime.now(timezone.utc).isoformat(),
+        "phase": "monitoring",
+        "snapshot": autopilot.metric_snapshot(m, 240),
+    }
+    return run, state, record
+
+
+def test_relaunch_baseline_is_the_resumed_checkpoint(tmp_path: Path,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    run, state, record = _relaunch_fixture(tmp_path, monkeypatch, "model_0.pt")
+    changes = [{"key": "agent.algorithm.entropy-coef", "value": 0.05}]
+    autopilot._relaunch(run, changes, _cfg(), state, record, tmp_path / "rec.json",
+                        {"last_checkpoint_iter": 0}, ["train", "Mjlab-Velocity-Flat-MicroDuck"])
+    inv = state["experiments"]["velocity"]["interventions"][-1]
+    assert inv["iter"] == 0
+    assert inv["stopped_at_iter"] == 240
+    assert inv["snapshot"]["iter"] == 0
+    assert inv["snapshot"]["fell_over"] == 40.0
+    assert inv["snapshot"]["mean_reward"] == -2.0
+
+
+def test_relaunch_without_checkpoint_has_no_baseline(tmp_path: Path,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    run, state, record = _relaunch_fixture(tmp_path, monkeypatch, None)
+    changes = [{"key": "agent.algorithm.entropy-coef", "value": 0.05}]
+    autopilot._relaunch(run, changes, _cfg(), state, record, tmp_path / "rec.json",
+                        {"last_checkpoint_iter": None}, ["train", "Mjlab-Velocity-Flat-MicroDuck"])
+    inv = state["experiments"]["velocity"]["interventions"][-1]
+    assert inv["snapshot"] is None
+    assert inv["stopped_at_iter"] == 240
+
+
 def test_second_revert_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _isolate_state(monkeypatch, tmp_path)
     inv = _pending(0, fell=1.0, reward=5.0)
@@ -350,3 +401,100 @@ def test_second_revert_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert out["status"] == "needs_human"
     assert "second" not in out["diagnosis"]
     assert "human" in out["diagnosis"]
+
+
+# --------------------------------------------------------------------- procs
+
+TRAIN = "/home/u/microduck_rl/.venv/bin/train"
+
+# pid, ppid, cmdline, started. systemd --user -> autopilot daemon -> uv -> trainer -> worker
+PROC_TABLE = [
+    (100, 1, ["/lib/systemd/systemd", "--user"], 1),
+    (200, 100, ["python", "autopilot.py", "run"], 2),
+    (300, 200, ["uv", "run", "train", "Mjlab-Velocity-Flat-MicroDuck"], 3),
+    (400, 300, ["python", TRAIN, "Mjlab-Velocity-Flat-MicroDuck"], 4),
+    (500, 400, ["python", "-c", "worker"], 5),
+]
+
+
+def _fake_procs(monkeypatch: pytest.MonkeyPatch, table: list[tuple]) -> None:
+    rows = [(pid, ppid, cmd, "/home/u/microduck_rl", started) for pid, ppid, cmd, started in table]
+    monkeypatch.setattr(autopilot, "_proc_iter", lambda: iter(rows))
+
+
+def test_stop_training_interrupts_only_the_trainer(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_procs(monkeypatch, PROC_TABLE)
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(autopilot.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    monkeypatch.setattr(autopilot, "_pid_alive", lambda pid: False)
+    autopilot.stop_training({"pid": 400}, _cfg(), {})
+    assert sent == [(400, autopilot.signal.SIGINT)]
+
+
+def test_stuck_trainer_escalates_on_its_tree_never_ancestors(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_procs(monkeypatch, PROC_TABLE)
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(autopilot.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    monkeypatch.setattr(autopilot, "_pid_alive", lambda pid: True)
+    clock = iter(range(0, 10**6, 100))
+    monkeypatch.setattr(autopilot, "time", SimpleNamespace(time=lambda: next(clock),
+                                                           sleep=lambda _s: None))
+    cfg = _cfg()
+    autopilot.stop_training({"pid": 400}, cfg, {})
+    assert {pid for pid, _ in sent} == {400, 500}
+    assert (500, autopilot.signal.SIGKILL) in sent
+
+
+def test_find_train_proc_skips_the_smoke_trainer(monkeypatch: pytest.MonkeyPatch) -> None:
+    table = PROC_TABLE + [
+        (600, 200, ["uv", "run", "train", "Mjlab-Velocity-Flat-MicroDuck"], 0),
+        (601, 600, ["python", TRAIN, "Mjlab-Velocity-Flat-MicroDuck"], 0),
+    ]
+    _fake_procs(monkeypatch, table)
+    proc = autopilot.find_train_proc({"smoke_pids": [600]})
+    assert proc is not None and proc["pid"] == 400
+
+
+# ------------------------------------------------------------- llm pausing
+
+
+def test_llm_pause_reason() -> None:
+    cfg = _cfg()
+    assert autopilot.llm_pause_reason(cfg, {"budget_used": 5}) is None
+    assert "budget exhausted" in autopilot.llm_pause_reason(cfg, {"budget_used": 6})
+    assert "needs_human" in autopilot.llm_pause_reason(cfg, {"needs_human": True})
+    cfg.monitor.min_iters_before_intervene = 500
+    cfg.monitor.cooldown_iters = 300
+    assert "too young" in autopilot.llm_pause_reason(cfg, {}, 100)
+    assert "cooldown" in autopilot.llm_pause_reason(cfg, {"last_intervention_iter": 600}, 899)
+    assert autopilot.llm_pause_reason(cfg, {"last_intervention_iter": 600}, 900) is None
+
+
+def test_monitoring_skips_llm_when_budget_is_spent(tmp_path: Path,
+                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    _isolate_state(monkeypatch, tmp_path)
+    entropy = [(100 + i, 10.0 if i < 5 else 0.1) for i in range(20)]
+    m = _metrics(**{
+        "Loss/entropy": entropy,
+        "Train/mean_reward": [(119, 1.0)],
+        "Train/mean_episode_length": [(119, 20.0)],
+    })
+    monkeypatch.setattr(autopilot.Metrics, "load", lambda _run: m)
+    monkeypatch.setattr(autopilot, "run_cfg", lambda _run: ({}, {"max_iterations": 1000}))
+    monkeypatch.setattr(autopilot, "find_train_proc", lambda state=None: None)
+
+    def _no_llm(*_a, **_k):
+        raise AssertionError("LLM must not be called with the budget spent")
+
+    monkeypatch.setattr(autopilot, "llm_analyze", _no_llm)
+    state = {"experiments": {"velocity": {"budget_used": 6}}}
+    out = autopilot.monitoring_phase(_cfg(), state, autopilot.Run(tmp_path, "velocity", "r"),
+                                     force=False, approve=True)
+    assert out["status"] == "llm_paused"
+    assert "entropy_collapse" in out["findings"]
+    assert out["llm_s"] == 0
+
+    autopilot.cmd_reset(_cfg(), "velocity", queue=False)
+    exp = autopilot.load_state()["experiments"]["velocity"]
+    assert exp["budget_used"] == 0
+    assert "llm_paused" not in exp
