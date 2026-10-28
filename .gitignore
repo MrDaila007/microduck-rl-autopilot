@@ -1,0 +1,7 @@
+# runtime state + spawned-run stdout — machine-local, regenerable
+logs/
+# per-session journals: kept on disk, not in git (they grow forever)
+reports/*
+!reports/.gitkeep
+__pycache__/
+*.pyc

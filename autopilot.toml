@@ -1,0 +1,76 @@
+# microduck_rl training autopilot — see docs/autopilot.md
+#
+# Monitors a local mjlab run, checks AGENTS.md invariants, asks the local
+# Ollama model for a diagnosis and (auto=true) applies allowlisted overrides:
+# smoke test -> stop -> resume from the latest checkpoint with the change.
+
+[paths]
+# The training project this autopilot supervises: tfevents are read from
+# <mjlab_repo>/logs/rsl_rl and spawned training runs with that cwd.
+mjlab_repo = "../microduck_rl"
+
+[auto]
+# true  = daemon validates + smoke-tests + applies + relaunches on its own
+# false = writes recommendation JSON only (human runs `autopilot apply`)
+enabled = true
+# Start `train.command` by itself when nothing is running. Leave false unless
+# you want the daemon to own the very first launch too.
+start_if_idle = false
+
+[llm]
+base_url = "http://127.0.0.1:11434"
+model = "qwen3.5:35b-a3b-q4_K_M"
+max_tokens = 3000
+timeout_s = 300
+temperature = 0.2
+
+[monitor]
+tick_s = 60                    # daemon poll interval
+analyze_every_iters = 5        # consult the LLM every N new iterations
+active_after_s = 300           # run dir with tfevents newer than this = active
+min_iters_before_intervene = 50  # never touch a run younger than this
+stagnation_window = 100        # iterations considered by trend rules
+stagnation_min_iters = 200     # stagnation rule only fires after this many
+stagnation_rel_gain = 0.02     # mean_reward gain below this over window = flat
+cooldown_iters = 10            # min iterations between two interventions
+max_interventions = 6          # budget per experiment, then human only
+confidence_min = 0.6           # LLM confidence required to auto-apply
+
+[train]
+# First-launch command (used by `autopilot launch` / start_if_idle).
+command = "uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 4096"
+smoke_envs = 64                # AGENTS.md smoke test
+smoke_iters = 5
+smoke_timeout_s = 1200
+stop_grace_s = 180             # SIGINT -> wait for a final checkpoint -> SIGTERM
+save_interval = 50             # set on every relaunch: rsl_rl only saves a
+                               # checkpoint every save_interval iters, so this
+                               # bounds what an intervention can lose
+# Extra env for spawned training. WANDB_MODE is NOT set here: the autopilot
+# adds WANDB_MODE=offline only when there are no wandb credentials; with
+# ~/.netrc present, runs log to the dashboard and tfevents feed the analysis.
+[train.env]
+
+[safety]
+# What the LLM may change (tyro CLI spellings, fnmatch patterns).
+allow = [
+  "env.rewards.*.weight",
+  "agent.max-iterations",
+  "agent.algorithm.learning-rate",
+  "agent.algorithm.entropy-coef",
+  "env.scene.num-envs",
+]
+# Everything not matching `allow` is rejected. This also keeps obs terms
+# (env.observations.*), robot/actuator cfg and curricula (env.events.*) off
+# limits — those are AGENTS.md invariants, see docs/autopilot.md.
+deny = []
+max_changes = 3
+penalty_eps = 0.01             # Episode_Reward/<penalty> above this = sign bug
+
+# Numeric bounds per pattern (also applied to the daemon's own relaunch flags).
+[safety.ranges]
+"env.rewards.*.weight" = [-10.0, 10.0]
+"agent.max-iterations" = [1, 20000]
+"agent.algorithm.learning-rate" = [1e-6, 0.01]
+"agent.algorithm.entropy-coef" = [0.0, 0.5]
+"env.scene.num-envs" = [64, 32768]
