@@ -19,6 +19,7 @@ autopilot status                      # what is running, queue, last verdict
 autopilot scenarios                   # the whole training-scenario catalog
 autopilot launch velstand             # start any registered scenario
 autopilot plan --force --recommend-only   # dry-plan an ended run
+autopilot dashboard                   # http://127.0.0.1:8765
 apup                                  # start the daemon (alias for systemctl --user)
 ```
 

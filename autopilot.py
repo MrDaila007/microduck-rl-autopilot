@@ -35,6 +35,7 @@ Commands:
   apply REC.json             validate + smoke-test + restart for a saved rec
   launch [SCENARIO]          start a named scenario (or default/train.command)
   reset [--experiment X] [--queue]  clear budget/completed marks (+ queue)
+  dashboard                  local web UI (default http://127.0.0.1:8765)
 """
 
 from __future__ import annotations
@@ -149,6 +150,13 @@ class PathsCfg:
 
 
 @dataclass
+class DashboardCfg:
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 8765
+
+
+@dataclass
 class Config:
     llm: LlmCfg = field(default_factory=LlmCfg)
     monitor: MonitorCfg = field(default_factory=MonitorCfg)
@@ -156,6 +164,7 @@ class Config:
     train: TrainCfg_ = field(default_factory=TrainCfg_)
     auto: AutoCfg = field(default_factory=AutoCfg)
     paths: PathsCfg = field(default_factory=PathsCfg)
+    dashboard: DashboardCfg = field(default_factory=DashboardCfg)
 
 
 def load_config(path: Path = CONFIG_FILE) -> Config:
@@ -172,6 +181,7 @@ def load_config(path: Path = CONFIG_FILE) -> Config:
         ("train", TrainCfg_),
         ("auto", AutoCfg),
         ("paths", PathsCfg),
+        ("dashboard", DashboardCfg),
     ):
         if section in raw:
             base = getattr(cfg, section)
@@ -1530,8 +1540,13 @@ def release_stale_intervening(cfg: Config, state: dict) -> str | None:
 
 def _smoke_then_relaunch(run: Run, changes: list[dict], cfg: Config, state: dict,
                          record: dict, rec_path: Path, argv: list[str],
-                         proc: dict | None) -> dict:
-    """Smoke, then relaunch. intervening is always cleared, including on crash."""
+                         proc: dict | None, force_apply: bool = False) -> dict:
+    """Smoke, then relaunch. intervening is always cleared, including on crash.
+
+    force_apply is an explicit human apply (CLI `apply` or the dashboard).
+    It relaunches after a passing smoke even when auto.enabled is false.
+    The auto flag still gates the daemon's own unattended decisions.
+    """
     record["status"] = "smoking"
     save_json(rec_path, record)
     _mark_intervening(state)
@@ -1543,7 +1558,7 @@ def _smoke_then_relaunch(run: Run, changes: list[dict], cfg: Config, state: dict
             save_json(rec_path, record)
             log.error("smoke test failed: %s", why)
             return record
-        if not cfg.auto.enabled:
+        if not cfg.auto.enabled and not force_apply:
             record["status"] = "ready_to_apply"
             save_json(rec_path, record)
             log.info("smoke passed; auto disabled — run: autopilot apply %s", rec_path)
@@ -1567,8 +1582,12 @@ def _smoke_then_relaunch(run: Run, changes: list[dict], cfg: Config, state: dict
 
 
 def do_intervention(rec: dict, run: Run, cfg: Config, state: dict,
-                    phase: str = "monitoring") -> dict:
-    """Validate -> (smoke) -> stop/relaunch, or record the decision."""
+                    phase: str = "monitoring", force_apply: bool = False) -> dict:
+    """Validate -> (smoke) -> stop/relaunch, or record the decision.
+
+    force_apply skips the auto.enabled gate (a person asked). It does not
+    spend the intervention budget; callers that auto-apply still do that.
+    """
     tag = datetime.now().strftime("%Y%m%d-%H%M%S")
     exp = exp_state(state, run.experiment)
     record = dict(rec)
@@ -1606,7 +1625,7 @@ def do_intervention(rec: dict, run: Run, cfg: Config, state: dict,
             save_json(rec_path, record)
             log.info("run %s: plan completed (%s)", run.dir.name, rec.get("diagnosis", "")[:200])
             return record
-        if not cfg.auto.enabled:
+        if not cfg.auto.enabled and not force_apply:
             record["status"] = "ready_to_relaunch"
             save_json(rec_path, record)
             return record
@@ -1614,7 +1633,7 @@ def do_intervention(rec: dict, run: Run, cfg: Config, state: dict,
 
     if rec["verdict"] == "abort":
         proc = find_train_proc(state)
-        if cfg.auto.enabled and proc:
+        if (cfg.auto.enabled or force_apply) and proc:
             stop_training(proc, cfg, state)
             record["status"] = "run_stopped"
         else:
@@ -1644,12 +1663,13 @@ def do_intervention(rec: dict, run: Run, cfg: Config, state: dict,
 
     proc = find_train_proc(state)
     live = proc is not None and phase == "monitoring"
-    if not live and not cfg.auto.enabled:
+    if not live and not cfg.auto.enabled and not force_apply:
         record["status"] = "ready_to_apply"
         save_json(rec_path, record)
         return record
     return _smoke_then_relaunch(
         run, changes, cfg, state, record, rec_path, argv, proc if live else None,
+        force_apply=force_apply,
     )
 
 
@@ -2274,11 +2294,25 @@ def cmd_run(cfg: Config) -> int:
              cfg.auto.enabled, cfg.llm.model, cfg.monitor.tick_s, wandb_has_creds())
     report = SessionReport(cfg)
     log.info("session report: %s", report.path)
+    import dashboard as dash
+    rt = None
+    if cfg.dashboard.enabled:
+        rt = dash.attach(cfg)
+        try:
+            dash.serve(rt)
+            log.info("dashboard %s", dash.url(rt.cfg, rt.bound_port))
+        except Exception as exc:
+            log.error("dashboard not started: %s", exc)
+            dash.detach()
+            rt = None
 
     while not stop["flag"]:
         status: dict = {}
         _reap_children()
         try:
+            if rt is not None:
+                dash.reload_if_stale(rt)
+                cfg = rt.cfg
             state = load_state()
             status = {"time": datetime.now(timezone.utc).isoformat()}
             cleared = settle_smoke(cfg, state)
@@ -2299,16 +2333,34 @@ def cmd_run(cfg: Config) -> int:
         sleep_s = int(status.get("sleep_s") or cfg.monitor.tick_s)
         sleep_s = max(1, min(sleep_s, cfg.monitor.max_sleep_s))
         log.debug("sleeping %ss (eta=%s)", sleep_s, status.get("eta_s"))
-        for _ in range(sleep_s):
-            if stop["flag"]:
-                break
-            time.sleep(1)
+        if rt is not None:
+            dash.wait_wake(rt, sleep_s, stop)
+        else:
+            for _ in range(sleep_s):
+                if stop["flag"]:
+                    break
+                time.sleep(1)
+    if rt is not None and rt.httpd is not None:
+        dash.stop_server(rt)
     report.finish("signal")
     return 0
 
 
 def _cycle_once(cfg: Config, state: dict) -> dict:
-    """One wake: monitoring (active) | post_run (ended, unplanned) | idle."""
+    """One wake: dashboard action | monitoring | post_run | idle.
+
+    A dashboard action runs instead of the monitoring pass so a smoke test
+    and a wake never overlap. The next wake resumes the normal cycle.
+    """
+    import dashboard as dash
+
+    rt = dash.runtime()
+    if rt is not None:
+        dash.reload_if_stale(rt)
+        cfg = rt.cfg
+        acted = dash.drain_one(rt, state)
+        if acted is not None:
+            return acted
     # remember the live launch command every wake, so a later post-run
     # relaunch knows the original argv even if we never analyzed mid-run
     proc = find_train_proc(state)
@@ -2477,7 +2529,8 @@ def cmd_apply(cfg: Config, rec_path: Path) -> int:
     if not runs:
         print("no runs", file=sys.stderr)
         return 2
-    out = do_intervention(rec, runs[-1], cfg, state, phase=rec.get("phase", "monitoring"))
+    out = do_intervention(rec, runs[-1], cfg, state, phase=rec.get("phase", "monitoring"),
+                          force_apply=True)
     print(json.dumps(out, indent=2, default=str))
     return 0 if out.get("status") in ("applied", "keep", "plan_completed",
                                       "ready_to_apply", "ready_to_relaunch") else 1
@@ -2544,6 +2597,47 @@ def cmd_scenarios(cfg: Config) -> int:
     return 0
 
 
+def cmd_dashboard(cfg: Config) -> int:
+    """Serve the local UI. If the daemon already holds the port, just print the URL.
+
+    Without a daemon this process also drains the action inbox, so launch /
+    stop / config still work. It does not run the monitoring cycle.
+    """
+    import errno
+
+    import dashboard as dash
+
+    rt = dash.attach(cfg)
+    try:
+        dash.serve(rt)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            print(f"dashboard already running at {dash.url(cfg)}")
+            return 0
+        raise
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(dash.url(rt.cfg, rt.bound_port))
+    stop = {"flag": False}
+
+    def _sig(_s, _f):
+        stop["flag"] = True
+        log.info("dashboard shutting down")
+
+    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _sig)
+    while not stop["flag"]:
+        try:
+            dash.reload_if_stale(rt)
+            dash.drain_one(rt, load_state())
+        except Exception:
+            log.exception("dashboard action failed")
+        dash.wait_wake(rt, 1, stop)
+    dash.stop_server(rt)
+    return 0
+
+
 def cmd_reset(cfg: Config, experiment: str | None, queue: bool) -> int:
     state = load_state()
     targets = [experiment] if experiment else list(state.get("experiments", {}))
@@ -2581,6 +2675,7 @@ def main() -> int:
     p_lch.add_argument("scenario", nargs="?", default=None,
                        help="scenario name from autopilot.toml [train.scenarios]")
     sub.add_parser("scenarios")
+    sub.add_parser("dashboard")
     p_res = sub.add_parser("reset")
     p_res.add_argument("--experiment", default=None)
     p_res.add_argument("--queue", action="store_true", help="clear scenario queue progress")
@@ -2605,6 +2700,8 @@ def main() -> int:
         return cmd_launch(cfg, args.scenario)
     if args.cmd == "scenarios":
         return cmd_scenarios(cfg)
+    if args.cmd == "dashboard":
+        return cmd_dashboard(cfg)
     if args.cmd == "reset":
         return cmd_reset(cfg, args.experiment, args.queue)
     return 2

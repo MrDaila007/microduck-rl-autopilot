@@ -131,7 +131,33 @@ autopilot apply REC.json       # validate+smoke+stop+relaunch for a saved rec
 autopilot launch [SCENARIO]    # start a named scenario (or default/train.command)
 autopilot reset [--experiment NAME] [--queue]  # clear budget/completed marks (+ queue)
 autopilot run                  # daemon (systemd runs this)
+autopilot dashboard            # local UI, http://127.0.0.1:8765
 ```
+
+## Dashboard
+
+`autopilot dashboard` opens a loopback page (`[dashboard]` in `autopilot.toml`,
+default `http://127.0.0.1:8765`). The daemon serves the same page while it
+runs; if the port is already taken the command only prints the URL.
+
+The page reads the files the cycle already writes (status, state,
+recommendations, tfevents) and shows phase, ETA, reward / falls / entropy,
+the scenario queue and the last verdicts. Buttons do not call smoke or
+`stop` on the HTTP thread. They enqueue one action; the daemon drains it at
+the start of the next wake (the sleep is interrupted within a second). A
+second click while a smoke test or another action is in progress gets HTTP
+409.
+
+Manual hyperparameter edits and `autopilot apply` are explicit human applies:
+they still go through `validate_rec` (allowlist, ranges, `max_changes`, no
+shorter `agent.max-iterations`) and the 64-env / 5-iter smoke test. The live
+run is stopped only after smoke passes, even when `auto.enabled` is false.
+That path does not spend the unattended intervention budget.
+
+Settings write a whitelist of keys back into `autopilot.toml` (auto flags,
+monitor cadence, queue, default scenario, existing safety ranges, LLM model).
+Comments and `[train.scenarios.*]` are left as they are. The daemon reloads
+the file when its mtime changes. A non-loopback `dashboard.host` is rejected.
 
 ## Training scenarios (the whole policy family)
 
@@ -188,6 +214,7 @@ Notes:
 ```
 autopilot/
   autopilot.py, autopilot.toml   code + config
+  dashboard.py, dashboard/       local web UI (stdlib HTTP + one static page)
   docs/autopilot.md              this reference
   reports/
     session-*.md                 per-daemon-session journal: verdicts,

@@ -17,6 +17,13 @@ enabled = true
 # you want the daemon to own the very first launch too.
 start_if_idle = false
 
+[dashboard]
+# Local web UI. The daemon serves it; `autopilot dashboard` does too when the
+# daemon is not running. A host other than loopback is rejected.
+enabled = true
+host = "127.0.0.1"
+port = 8765
+
 [llm]
 base_url = "http://127.0.0.1:11434"
 model = "qwen3.5:35b-a3b-q4_K_M"
