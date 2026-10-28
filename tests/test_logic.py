@@ -244,14 +244,30 @@ def test_settle_closes_old_smoking_without_a_flag(tmp_path: Path, monkeypatch: p
 # -------------------------------------------------------------------- revert
 
 
-def test_window_worse_requires_both_falls_and_reward() -> None:
+def test_window_worse_judges_survival_not_reward() -> None:
     m = _metrics(**{
+        "Train/mean_episode_length": [(1, 150.0), (2, 150.0)],
         "Episode_Termination/fell_over": [(1, 20.0), (2, 20.0)],
-        "Train/mean_reward": [(1, 1.0), (2, 1.0)],
+        "Episode_Termination/time_out": [(1, 1.0), (2, 1.0)],
+        "Train/mean_reward": [(1, 9.0), (2, 9.0)],
     })
-    assert autopilot.window_worse(m, {"fell_over": 5.0, "mean_reward": 4.0}, 1, 2)
-    assert not autopilot.window_worse(m, {"fell_over": 5.0, "mean_reward": 0.5}, 1, 2)
-    assert not autopilot.window_worse(m, {"fell_over": 30.0, "mean_reward": 4.0}, 1, 2)
+    # shorter episodes are worse even though the (rescaled) reward went up
+    assert autopilot.window_worse(m, {"ep_len_w": 200.0, "fall_share_w": 0.9, "mean_reward": 1.0}, 1, 2)
+    # a 5% drop is noise
+    assert not autopilot.window_worse(m, {"ep_len_w": 158.0}, 1, 2)
+    # fewer falls excuse shorter episodes (more time-outs / resets)
+    assert not autopilot.window_worse(m, {"ep_len_w": 200.0, "fall_share_w": 0.99}, 1, 2)
+    # old snapshots without window means fall back to the point value
+    assert autopilot.window_worse(m, {"mean_episode_length": 200.0}, 1, 2)
+
+
+def test_fall_share_is_a_ratio_of_counts() -> None:
+    m = _metrics(**{
+        "Episode_Termination/fell_over": [(1, 20.76)],
+        "Episode_Termination/time_out": [(1, 0.39)],
+        "Episode_Termination/nan_state": [(1, 0.0)],
+    })
+    assert autopilot.fall_share(m, 0, 1) == pytest.approx(0.9816, abs=1e-3)
 
 
 def test_revertable_changes_drop_a_shorter_horizon() -> None:
@@ -277,14 +293,14 @@ def test_previous_values_read_reward_and_entropy() -> None:
     assert all(row["key"] != "env.observations.foo.scale" for row in prev)
 
 
-def _pending(iter_at: int, fell: float, reward: float, previous: list[dict] | None = None) -> dict:
+def _pending(iter_at: int, ep_len: float, previous: list[dict] | None = None) -> dict:
     return {
         "kind": "apply",
         "changes": [{"key": "agent.algorithm.entropy-coef", "value": 0.05}],
         "previous": previous if previous is not None else [
             {"key": "agent.algorithm.entropy-coef", "value": 0.01},
         ],
-        "snapshot": {"iter": iter_at, "fell_over": fell, "mean_reward": reward},
+        "snapshot": {"iter": iter_at, "ep_len_w": ep_len},
         "iter": iter_at,
         "outcome": "pending",
     }
@@ -292,10 +308,9 @@ def _pending(iter_at: int, fell: float, reward: float, previous: list[dict] | No
 
 def test_revert_marks_ok_when_the_window_holds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _isolate_state(monkeypatch, tmp_path)
-    exp = {"interventions": [_pending(0, fell=10.0, reward=1.0)], "budget_used": 0}
+    exp = {"interventions": [_pending(0, ep_len=100.0)], "budget_used": 0}
     m = _metrics(**{
-        "Episode_Termination/fell_over": [(i, 2.0) for i in range(1, 12)],
-        "Train/mean_reward": [(i, 5.0) for i in range(1, 12)],
+        "Train/mean_episode_length": [(i, 120.0) for i in range(1, 12)],
     })
     out = autopilot.maybe_revert(_cfg(), {"experiments": {}}, autopilot.Run(tmp_path, "velocity", "r"),
                                  m, exp, 11, apply=True)
@@ -305,10 +320,9 @@ def test_revert_marks_ok_when_the_window_holds(tmp_path: Path, monkeypatch: pyte
 
 def test_revert_recommends_when_auto_apply_is_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _isolate_state(monkeypatch, tmp_path)
-    exp = {"interventions": [_pending(0, fell=1.0, reward=5.0)]}
+    exp = {"interventions": [_pending(0, ep_len=200.0)]}
     m = _metrics(**{
-        "Episode_Termination/fell_over": [(i, 9.0) for i in range(1, 12)],
-        "Train/mean_reward": [(i, 0.2) for i in range(1, 12)],
+        "Train/mean_episode_length": [(i, 120.0) for i in range(1, 12)],
     })
     out = autopilot.maybe_revert(_cfg(), {}, autopilot.Run(tmp_path, "velocity", "r"),
                                  m, exp, 11, apply=False)
@@ -319,13 +333,12 @@ def test_revert_recommends_when_auto_apply_is_off(tmp_path: Path, monkeypatch: p
 
 def test_revert_flags_human_when_nothing_can_be_undone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _isolate_state(monkeypatch, tmp_path)
-    inv = _pending(0, fell=1.0, reward=5.0, previous=[
+    inv = _pending(0, ep_len=200.0, previous=[
         {"key": "agent.max-iterations", "value": 1000},
     ])
     exp = {"interventions": [inv], "target_iterations": 50000, "budget_used": 0}
     m = _metrics(**{
-        "Episode_Termination/fell_over": [(i, 9.0) for i in range(1, 12)],
-        "Train/mean_reward": [(i, 0.2) for i in range(1, 12)],
+        "Train/mean_episode_length": [(i, 120.0) for i in range(1, 12)],
     })
     out = autopilot.maybe_revert(_cfg(), {}, autopilot.Run(tmp_path, "velocity", "r"),
                                  m, exp, 11, apply=True)
@@ -387,13 +400,12 @@ def test_relaunch_without_checkpoint_has_no_baseline(tmp_path: Path,
 
 def test_second_revert_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _isolate_state(monkeypatch, tmp_path)
-    inv = _pending(0, fell=1.0, reward=5.0)
+    inv = _pending(0, ep_len=200.0)
     inv["outcome"] = "reverted"
     inv["reverted_at_iter"] = 0
     exp = {"interventions": [inv]}
     m = _metrics(**{
-        "Episode_Termination/fell_over": [(i, 9.0) for i in range(1, 12)],
-        "Train/mean_reward": [(i, 0.2) for i in range(1, 12)],
+        "Train/mean_episode_length": [(i, 120.0) for i in range(1, 12)],
     })
     out = autopilot.maybe_revert(_cfg(), {}, autopilot.Run(tmp_path, "velocity", "r"),
                                  m, exp, 11, apply=True)
@@ -498,3 +510,38 @@ def test_monitoring_skips_llm_when_budget_is_spent(tmp_path: Path,
     exp = autopilot.load_state()["experiments"]["velocity"]
     assert exp["budget_used"] == 0
     assert "llm_paused" not in exp
+
+
+# --------------------------------------------------------- revert x curriculum
+
+
+def test_revert_is_inconclusive_when_curriculum_steps_early(tmp_path: Path,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    _isolate_state(monkeypatch, tmp_path)
+    exp = {"interventions": [_pending(0, ep_len=200.0)], "budget_used": 0}
+    m = _metrics(**{
+        "Train/mean_episode_length": [(i, 120.0) for i in range(1, 12)],
+        "Curriculum/com_range": [(i, 0.005 if i < 3 else 0.01) for i in range(1, 12)],
+    })
+    out = autopilot.maybe_revert(_cfg(), {}, autopilot.Run(tmp_path, "velocity", "r"),
+                                 m, exp, 11, apply=True)
+    assert out is None
+    assert exp["interventions"][0]["outcome"] == "inconclusive"
+    assert "com_range" in exp["interventions"][0]["inconclusive_reason"]
+
+
+def test_revert_judges_only_the_stretch_before_a_curriculum_step(tmp_path: Path,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    _isolate_state(monkeypatch, tmp_path)
+    exp = {"interventions": [_pending(0, ep_len=200.0)], "budget_used": 0}
+    # resume warm-up reads short, then healthy until the stage change at iter 20,
+    # where the harder stage shortens episodes
+    m = _metrics(**{
+        "Train/mean_episode_length": [(i, 40.0 if i < 5 else 210.0 if i < 20 else 50.0)
+                                      for i in range(1, 31)],
+        "Curriculum/com_range": [(i, 0.005 if i < 20 else 0.01) for i in range(1, 31)],
+    })
+    out = autopilot.maybe_revert(_cfg(), {}, autopilot.Run(tmp_path, "velocity", "r"),
+                                 m, exp, 30, apply=True)
+    assert out is None
+    assert exp["interventions"][0]["outcome"] == "ok"

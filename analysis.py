@@ -474,8 +474,45 @@ def validate_rec(rec: dict, cfg: Config, require_target_extension: bool = False,
     return not errors, errors
 
 
+SNAPSHOT_WINDOW = 25        # iterations averaged into the pre-change baseline
+# A relaunch resets every env: until one full episode has elapsed (1000 steps
+# / 24 steps per iter ~ 42 iters) only short episodes complete, so episode
+# length and per-episode rewards read low right after a resume.
+RESUME_WARMUP_ITERS = 50
+EP_LEN_DROP = 0.10          # relative episode-length loss that counts as worse
+FALL_SHARE_SLACK = 0.01     # fall share must improve by more than this to excuse it
+
+
+def fall_share(m: Metrics, lo: int, hi: int) -> float | None:
+    """Fraction of episode endings that are falls in [lo, hi].
+
+    Episode_Termination/<term> is a COUNT of envs ended by that term per env
+    step (mjlab termination_manager), not a rate: only the ratio is readable.
+    """
+    fell = m.stats("Episode_Termination/fell_over", lo, hi)
+    if not fell.get("n"):
+        return None
+    total = 0.0
+    for tag in m.tags:
+        if tag.startswith("Episode_Termination/"):
+            st = m.stats(tag, lo, hi)
+            if st.get("n"):
+                total += max(st["mean"], 0.0)
+    return round(fell["mean"] / total, 4) if total > 0 else None
+
+
+def _window_mean(m: Metrics, tag: str, lo: int, hi: int) -> float | None:
+    st = m.stats(tag, lo, hi)
+    return st["mean"] if st.get("n") else None
+
+
 def metric_snapshot(m: Metrics, it: int) -> dict:
-    """Point values at `it` (last sample at or before it) for the revert check."""
+    """Baseline at `it` for the revert check and the intervention ledger.
+
+    Point values (last sample at or before it) plus SNAPSHOT_WINDOW means of
+    the weight-invariant metrics. mean_reward is kept for the record only: a
+    reward-weight change rescales it, so it cannot judge that change.
+    """
     snap: dict[str, Any] = {"iter": it}
     for name, tag in (
         ("mean_reward", "Train/mean_reward"),
@@ -485,22 +522,49 @@ def metric_snapshot(m: Metrics, it: int) -> dict:
     ):
         pts = [(step, v) for step, v in m.series(tag) if step <= it and math.isfinite(v)]
         snap[name] = pts[-1][1] if pts else None
+    lo = max(0, it - SNAPSHOT_WINDOW + 1)
+    snap["ep_len_w"] = _window_mean(m, "Train/mean_episode_length", lo, it)
+    snap["fall_share_w"] = fall_share(m, lo, it)
+    snap["error_vel_xy_w"] = _window_mean(m, "Metrics/twist/error_vel_xy", lo, it)
     return snap
 
 
+def _num(v: Any) -> float | None:
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+        return None
+    return float(v)
+
+
 def window_worse(m: Metrics, snap: dict, lo: int, hi: int) -> bool:
-    """True when the post-change window fell more AND scored less than the snapshot."""
-    base_fell = snap.get("fell_over")
-    base_rew = snap.get("mean_reward")
-    if isinstance(base_fell, bool) or isinstance(base_rew, bool):
+    """True when the policy survives clearly shorter than at the baseline.
+
+    Judged on weight-invariant metrics only: episode length must drop by
+    EP_LEN_DROP and, when both sides know it, the fall share must not have
+    improved. Older snapshots without window means use their point values.
+    """
+    base_len = _num(snap.get("ep_len_w")) or _num(snap.get("mean_episode_length"))
+    post_len = _window_mean(m, "Train/mean_episode_length", lo, hi)
+    if base_len is None or post_len is None or base_len <= 0:
         return False
-    if not isinstance(base_fell, (int, float)) or not isinstance(base_rew, (int, float)):
-        return False
-    fell = m.stats("Episode_Termination/fell_over", lo, hi)
-    rew = m.stats("Train/mean_reward", lo, hi)
-    if fell.get("n", 0) < 1 or rew.get("n", 0) < 1:
-        return False
-    return fell["mean"] > float(base_fell) and rew["mean"] < float(base_rew)
+    shorter = post_len < (1.0 - EP_LEN_DROP) * base_len
+    base_fs = _num(snap.get("fall_share_w"))
+    post_fs = fall_share(m, lo, hi)
+    if base_fs is not None and post_fs is not None:
+        return shorter and post_fs >= base_fs - FALL_SHARE_SLACK
+    return shorter
+
+
+def curriculum_changes_in(m: Metrics, lo: int, hi: int) -> dict[str, int]:
+    """First iteration inside (lo, hi] at which each Curriculum/* term changed."""
+    changed: dict[str, int] = {}
+    for tag in sorted(t for t in m.tags if t.startswith("Curriculum/")):
+        prev = None
+        for st, v in m.series(tag):
+            if prev is not None and lo < st <= hi and abs(v - prev) > 1e-9:
+                changed[tag.removeprefix("Curriculum/")] = st
+                break
+            prev = v
+    return changed
 
 
 def should_consult_llm(phase: str, findings: list[Finding], plateau: dict | None) -> bool:

@@ -82,13 +82,17 @@ log = logging.getLogger("autopilot")
 from analysis import (  # noqa: E402
     ANALYSIS_TAGS,
     CHANGE_MONEY_TAGS,
+    EP_LEN_DROP,
     PENALTY_FUNC_RE,
+    RESUME_WARMUP_ITERS,
     VERDICTS,
     Finding,
     Metrics,
     build_analysis,
     checkpoints_report,
+    curriculum_changes_in,
     curriculum_pacing,
+    fall_share,
     health_report,
     metric_snapshot,
     penalty_audit,
@@ -1436,14 +1440,32 @@ def maybe_revert(cfg: Config, state: dict, run: Run, m: Metrics, exp: dict,
         return None
     if it - base_iter < cfg.monitor.cooldown_iters:
         return None
-    if not window_worse(m, snap, base_iter + 1, it):
+    # A harder curriculum stage shortens episodes on its own, and the baseline
+    # was measured on the easier one: judge only the part before the step.
+    judge_lo = base_iter + 1 + min(RESUME_WARMUP_ITERS, cfg.monitor.cooldown_iters // 2)
+    judge_hi = it
+    stages = curriculum_changes_in(m, base_iter, it)
+    if stages:
+        judge_hi = min(stages.values()) - 1
+        if judge_hi - judge_lo < cfg.monitor.cooldown_iters // 2:
+            inv["outcome"] = "inconclusive"
+            inv["inconclusive_reason"] = (
+                f"curriculum changed {judge_hi + 1 - base_iter} iters after the change: "
+                f"{sorted(stages)}"
+            )
+            save_state(state)
+            log.info("revert check for iter %s inconclusive: %s",
+                     base_iter, inv["inconclusive_reason"])
+            return None
+    if not window_worse(m, snap, judge_lo, judge_hi):
         inv["outcome"] = "ok"
         save_state(state)
         return None
 
     diagnosis = (
-        f"reverting changes from iter {base_iter}: fell_over mean rose and "
-        "mean_reward fell versus the pre-change snapshot"
+        f"reverting changes from iter {base_iter}: episode length fell more than "
+        f"{EP_LEN_DROP:.0%} and the fall share did not improve versus the "
+        "checkpoint baseline"
     )
     if not apply:
         return {"status": "revert_recommended", "verdict": "adjust", "diagnosis": diagnosis}
