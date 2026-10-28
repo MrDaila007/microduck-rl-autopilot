@@ -138,9 +138,10 @@ autopilot dashboard            # local UI, http://127.0.0.1:8765
 
 ## Dashboard
 
-`autopilot dashboard` opens a loopback page (`[dashboard]` in `autopilot.toml`,
-default `http://127.0.0.1:8765`). The daemon serves the same page while it
-runs; if the port is already taken the command only prints the URL.
+`autopilot dashboard` opens the page from `[dashboard]` in `autopilot.toml`
+(`http://127.0.0.1:8765`). The daemon serves the
+same page while it runs; if the port is already taken the command only prints
+the URL.
 
 The page reads the files the cycle already writes (status, state,
 recommendations, tfevents) and shows phase, ETA, reward / falls / entropy,
@@ -159,7 +160,9 @@ That path does not spend the unattended intervention budget.
 Settings write a whitelist of keys back into `autopilot.toml` (auto flags,
 monitor cadence, queue, default scenario, existing safety ranges, LLM model).
 Comments and `[train.scenarios.*]` are left as they are. The daemon reloads
-the file when its mtime changes. A non-loopback `dashboard.host` is rejected.
+the file when its mtime changes. `dashboard.host` is loopback or one private
+address already on this machine. `0.0.0.0` is
+rejected, so the page is not published on every interface.
 
 ## Training scenarios (the whole policy family)
 

@@ -19,7 +19,8 @@ start_if_idle = false
 
 [dashboard]
 # Local web UI. The daemon serves it; `autopilot dashboard` does too when the
-# daemon is not running. A host other than loopback is rejected.
+# daemon is not running. host is loopback or one private address on this
+# machine (0.0.0.0 is rejected).
 enabled = true
 host = "127.0.0.1"
 port = 8765

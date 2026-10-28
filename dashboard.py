@@ -5,11 +5,14 @@ The HTTP thread only reads status files and enqueues actions. The daemon
 (or `autopilot dashboard` when the daemon is down) drains the inbox on its
 own thread, so a smoke test never races a wake cycle.
 
-Bind address is loopback only. Static files live in ./dashboard/.
+Bind address is loopback or one private address on this machine.
+0.0.0.0 is rejected so the page is not opened on every interface.
+Static files live in ./dashboard/.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import threading
@@ -143,13 +146,26 @@ def detach() -> None:
 
 
 def check_bind_host(host: str) -> str:
-    """Dashboard listens on loopback only. Anything else is a footgun on a training box."""
+    """Loopback, or one private address (for example the ethernet IP).
+
+    A wildcard (0.0.0.0, ::) would also publish the page on every other
+    interface. The address is used as-is; the OS refuses a bind to an
+    address this machine does not have.
+    """
     cleaned = (host or "").strip().lower()
     if cleaned == "localhost":
         return "127.0.0.1"
     if cleaned in ("127.0.0.1", "::1"):
         return cleaned
-    raise ValueError(f"dashboard host must be loopback, got {host!r}")
+    try:
+        ip = ipaddress.ip_address(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"dashboard host must be an IP address, got {host!r}") from exc
+    if ip.is_unspecified or ip.is_multicast or not (ip.is_loopback or ip.is_private):
+        raise ValueError(
+            f"dashboard host must be loopback or one private address, got {host!r}"
+        )
+    return str(ip)
 
 
 def url(cfg: autopilot.Config, bound_port: int | None = None) -> str:

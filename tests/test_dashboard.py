@@ -250,7 +250,10 @@ def test_inbox_drains_one_action_at_a_time(tmp_path: Path, monkeypatch: pytest.M
         dashboard.detach()
 
 
-def test_non_loopback_host_is_rejected() -> None:
-    with pytest.raises(ValueError, match="loopback"):
+def test_bind_host_allows_one_private_address() -> None:
+    with pytest.raises(ValueError, match="private"):
         dashboard.check_bind_host("0.0.0.0")
+    with pytest.raises(ValueError, match="IP address"):
+        dashboard.check_bind_host("jetson")
     assert dashboard.check_bind_host("localhost") == "127.0.0.1"
+    assert dashboard.check_bind_host("192.168.0.10") == "192.168.0.10"
